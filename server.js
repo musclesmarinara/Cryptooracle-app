@@ -201,9 +201,14 @@ async function fetchAllSources() {
 // that doesn't already have a substantial history, so it's safe to call once.
 async function seedHistory() {
   const results = {};
+  // Make sure the state structure exists before we touch it (in case the DB
+  // loaded an older/empty shape).
+  if (!state.coins) state.coins = {};
   for (const coin of COINS) {
     try {
+      if (!state.coins[coin]) state.coins[coin] = defaultCoinState();
       const cs = state.coins[coin];
+      if (!Array.isArray(cs.priceHistory)) cs.priceHistory = [];
       if (cs.priceHistory.length >= 600) { results[coin] = 'skipped (already seeded)'; continue; }
       const pair = SOURCE_SYMBOLS[coin].kraken;
       const r = await timedFetch(`https://api.kraken.com/0/public/OHLC?pair=${pair}&interval=15`, 12000);
