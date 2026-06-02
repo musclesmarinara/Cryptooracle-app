@@ -1,0 +1,13 @@
+{
+  "name": "cryptooracle-backend",
+  "version": "1.0.0",
+  "description": "Always-on backend that fetches multi-source crypto prices, makes 15-min predictions, scores them, and self-adjusts model weights 24/7. Zero dependencies.",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
