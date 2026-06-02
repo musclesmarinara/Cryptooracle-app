@@ -202,31 +202,46 @@ async function cycle() {
     const { perCoin, status } = await fetchAllSources();
     const nowMs = Date.now();
     COINS.forEach(coin => {
-      const prices = Object.values(perCoin[coin]);
-      if (!prices.length) return;
-      const verified = median(prices);
-      state.lastPrices[coin] = { verified, sources: perCoin[coin], ts: nowMs };
       const cs = state.coins[coin];
-      cs.priceHistory.push({ t: nowMs, c: verified });
-      if (cs.priceHistory.length > 200) cs.priceHistory.shift();
+      const prices = Object.values(perCoin[coin]);
 
-      const stillPending = [];
-      cs.pending.forEach(p => {
-        if (nowMs < p.targetMs) { stillPending.push(p); return; }
-        const actual = verified;
-        const errPct = Math.abs(actual - p.predicted) / actual * 100;
-        const higherLower = actual > p.predicted ? 'HIGHER' : actual < p.predicted ? 'LOWER' : 'EXACT';
-        cs.log.unshift({ targetMs: p.targetMs, predicted: p.predicted, actual, higherLower, errPct, ts: nowMs });
-        if (cs.log.length > 1000) cs.log.pop();
-        Object.keys(cs.scores).forEach(k => {
-          if (p.models[k] === undefined) return;
-          cs.scores[k].e += Math.abs(actual - p.models[k]) / actual * 100;
-          cs.scores[k].n += 1;
+      // Determine the price to use this cycle.
+      // Prefer fresh sources; if none came in this minute, fall back to the
+      // last known verified price so scoring/history still proceed for EVERY coin.
+      let verified = null;
+      if (prices.length) {
+        verified = median(prices);
+        state.lastPrices[coin] = { verified, sources: perCoin[coin], ts: nowMs };
+        cs.priceHistory.push({ t: nowMs, c: verified });
+        if (cs.priceHistory.length > 200) cs.priceHistory.shift();
+      } else if (state.lastPrices[coin]?.verified) {
+        verified = state.lastPrices[coin].verified; // fallback for scoring only
+      }
+
+      // ----- Score any pending predictions whose target time has passed -----
+      // This now runs every cycle for every coin, as long as we have ANY price
+      // to compare against (fresh or last-known), so no coin gets left behind.
+      if (verified !== null) {
+        const stillPending = [];
+        cs.pending.forEach(p => {
+          if (nowMs < p.targetMs) { stillPending.push(p); return; }
+          const actual = verified;
+          const errPct = Math.abs(actual - p.predicted) / actual * 100;
+          const higherLower = actual > p.predicted ? 'HIGHER' : actual < p.predicted ? 'LOWER' : 'EXACT';
+          cs.log.unshift({ targetMs: p.targetMs, predicted: p.predicted, actual, higherLower, errPct, ts: nowMs });
+          if (cs.log.length > 1000) cs.log.pop();
+          Object.keys(cs.scores).forEach(k => {
+            if (p.models[k] === undefined) return;
+            cs.scores[k].e += Math.abs(actual - p.models[k]) / actual * 100;
+            cs.scores[k].n += 1;
+          });
+          recalcWeights(coin);
         });
-        recalcWeights(coin);
-      });
-      cs.pending = stillPending;
+        cs.pending = stillPending;
+      }
 
+      // ----- Make a fresh prediction for the next interval -----
+      // Only when we have enough real history (needs fresh price data to grow).
       const pred = predictNext(coin);
       if (pred) {
         const targetMs = nextBoundary();
