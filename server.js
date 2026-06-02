@@ -1,23 +1,38 @@
 // ============================================================
 //  CRYPTOORACLE BACKEND — always-on 24/7 prediction engine
-//  Zero external dependencies (uses only Node.js built-ins).
 //
 //  - Fetches multi-source prices every 60 seconds
 //  - Generates 15-min-ahead predictions
 //  - Scores them when their target time arrives (even with nobody watching)
 //  - Auto-adjusts model weights from realized accuracy
-//  - Persists everything to data.json on disk
+//  - Persists everything to a Postgres database (Neon) so data survives
+//    redeploys and accumulates for model training
 //  - Exposes a small JSON API the static website reads from
+//
+//  Requires env var: DATABASE_URL  (Neon Postgres connection string)
+//  Falls back to a local file if DATABASE_URL is not set (for local dev).
 // ============================================================
 
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import pg from 'pg';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
+const DATABASE_URL = process.env.DATABASE_URL || '';
 const PORT = process.env.PORT || 3000;
+const USE_DB = !!DATABASE_URL;
+
+// Postgres connection pool (only used when DATABASE_URL is set)
+let pool = null;
+if (USE_DB) {
+  pool = new pg.Pool({
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false } // Neon requires SSL
+  });
+}
 
 const COINS = ['bitcoin', 'ethereum', 'ripple'];
 const SOURCE_SYMBOLS = {
@@ -38,22 +53,72 @@ function defaultCoinState() {
     log: []
   };
 }
-function loadState() {
-  try {
-    if (fs.existsSync(DATA_FILE)) { state = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); console.log('[state] loaded'); }
-  } catch (e) { console.warn('[state] load failed:', e.message); }
+// ---------- Persistence (Postgres via Neon, with file fallback) ----------
+// Strategy: keep the whole in-memory `state` as the working copy, and persist
+// it as a single JSONB row. This keeps all prediction/scoring/learning logic
+// unchanged while making the data durable across redeploys.
+
+async function initDB() {
+  if (!USE_DB) return;
+  // One table, one row (id=1) holding the entire state as JSONB.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_state (
+      id INTEGER PRIMARY KEY,
+      data JSONB NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT now()
+    )
+  `);
+}
+
+async function loadState() {
+  if (USE_DB) {
+    try {
+      const res = await pool.query('SELECT data FROM app_state WHERE id = 1');
+      if (res.rows.length) {
+        state = res.rows[0].data;
+        console.log('[state] loaded from Postgres');
+      } else {
+        console.log('[state] no saved row yet — starting fresh');
+      }
+    } catch (e) {
+      console.warn('[state] DB load failed:', e.message);
+    }
+  } else {
+    try {
+      if (fs.existsSync(DATA_FILE)) { state = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); console.log('[state] loaded from file'); }
+    } catch (e) { console.warn('[state] file load failed:', e.message); }
+  }
   if (!state.coins) state.coins = {};
   if (!state.lastPrices) state.lastPrices = {};
   if (!state.lastStatus) state.lastStatus = {};
   COINS.forEach(c => { if (!state.coins[c]) state.coins[c] = defaultCoinState(); });
 }
+
 let saveTimer = null;
+let saveInFlight = false;
 function saveState() {
   if (saveTimer) return;
-  saveTimer = setTimeout(() => {
+  saveTimer = setTimeout(async () => {
     saveTimer = null;
-    try { state.updatedAt = Date.now(); fs.writeFileSync(DATA_FILE, JSON.stringify(state)); }
-    catch (e) { console.warn('[state] save failed:', e.message); }
+    state.updatedAt = Date.now();
+    if (USE_DB) {
+      if (saveInFlight) return; // avoid overlapping writes
+      saveInFlight = true;
+      try {
+        await pool.query(
+          `INSERT INTO app_state (id, data, updated_at) VALUES (1, $1, now())
+           ON CONFLICT (id) DO UPDATE SET data = $1, updated_at = now()`,
+          [state]
+        );
+      } catch (e) {
+        console.warn('[state] DB save failed:', e.message);
+      } finally {
+        saveInFlight = false;
+      }
+    } else {
+      try { fs.writeFileSync(DATA_FILE, JSON.stringify(state)); }
+      catch (e) { console.warn('[state] file save failed:', e.message); }
+    }
   }, 500);
 }
 
@@ -129,6 +194,44 @@ async function fetchAllSources() {
   return { perCoin, status };
 }
 
+// ---------- One-time historical seeding (Kraken 15-min candles) ----------
+// Kraken's public OHLC endpoint returns up to ~720 candles per request with
+// no API key. At interval=15 (minutes) that's ~7.5 days of history per coin —
+// a solid head start for the trainable model. Fills priceHistory for any coin
+// that doesn't already have a substantial history, so it's safe to call once.
+async function seedHistory() {
+  const results = {};
+  for (const coin of COINS) {
+    try {
+      const cs = state.coins[coin];
+      if (cs.priceHistory.length >= 600) { results[coin] = 'skipped (already seeded)'; continue; }
+      const pair = SOURCE_SYMBOLS[coin].kraken;
+      const r = await timedFetch(`https://api.kraken.com/0/public/OHLC?pair=${pair}&interval=15`, 12000);
+      if (!r.ok) { results[coin] = 'fetch failed ' + r.status; continue; }
+      const d = await r.json();
+      if (!d.result) { results[coin] = 'no result'; continue; }
+      // The result object has the candle array under a pair-named key (not "last")
+      const key = Object.keys(d.result).find(k => k !== 'last');
+      const candles = key ? d.result[key] : null;
+      if (!Array.isArray(candles) || !candles.length) { results[coin] = 'no candles'; continue; }
+      // Kraken candle: [time(sec), open, high, low, close, vwap, volume, count]
+      const hist = candles.map(c => ({ t: Number(c[0]) * 1000, c: parseFloat(c[4]) }))
+                          .filter(p => isFinite(p.c) && p.c > 0)
+                          .sort((a, b) => a.t - b.t);
+      // Merge in front of any live data we've already collected, keep chronological
+      const merged = [...hist, ...cs.priceHistory].sort((a, b) => a.t - b.t);
+      // De-dupe by timestamp and cap
+      const seen = new Set();
+      cs.priceHistory = merged.filter(p => { if (seen.has(p.t)) return false; seen.add(p.t); return true; }).slice(-1500);
+      results[coin] = `seeded ${hist.length} candles (history now ${cs.priceHistory.length})`;
+    } catch (e) {
+      results[coin] = 'error: ' + e.message;
+    }
+  }
+  saveState();
+  return results;
+}
+
 // ---------- Indicators ----------
 const sma = (a, p) => a.length < p ? null : a.slice(-p).reduce((x, y) => x + y, 0) / p;
 function ema(a, p) { if (!a.length) return null; const k = 2 / (p + 1); let e = a[0]; for (let i = 1; i < a.length; i++) e = a[i] * k + e * (1 - k); return e; }
@@ -202,31 +305,46 @@ async function cycle() {
     const { perCoin, status } = await fetchAllSources();
     const nowMs = Date.now();
     COINS.forEach(coin => {
-      const prices = Object.values(perCoin[coin]);
-      if (!prices.length) return;
-      const verified = median(prices);
-      state.lastPrices[coin] = { verified, sources: perCoin[coin], ts: nowMs };
       const cs = state.coins[coin];
-      cs.priceHistory.push({ t: nowMs, c: verified });
-      if (cs.priceHistory.length > 200) cs.priceHistory.shift();
+      const prices = Object.values(perCoin[coin]);
 
-      const stillPending = [];
-      cs.pending.forEach(p => {
-        if (nowMs < p.targetMs) { stillPending.push(p); return; }
-        const actual = verified;
-        const errPct = Math.abs(actual - p.predicted) / actual * 100;
-        const higherLower = actual > p.predicted ? 'HIGHER' : actual < p.predicted ? 'LOWER' : 'EXACT';
-        cs.log.unshift({ targetMs: p.targetMs, predicted: p.predicted, actual, higherLower, errPct, ts: nowMs });
-        if (cs.log.length > 1000) cs.log.pop();
-        Object.keys(cs.scores).forEach(k => {
-          if (p.models[k] === undefined) return;
-          cs.scores[k].e += Math.abs(actual - p.models[k]) / actual * 100;
-          cs.scores[k].n += 1;
+      // Determine the price to use this cycle.
+      // Prefer fresh sources; if none came in this minute, fall back to the
+      // last known verified price so scoring/history still proceed for EVERY coin.
+      let verified = null;
+      if (prices.length) {
+        verified = median(prices);
+        state.lastPrices[coin] = { verified, sources: perCoin[coin], ts: nowMs };
+        cs.priceHistory.push({ t: nowMs, c: verified });
+        if (cs.priceHistory.length > 1500) cs.priceHistory.shift();
+      } else if (state.lastPrices[coin]?.verified) {
+        verified = state.lastPrices[coin].verified; // fallback for scoring only
+      }
+
+      // ----- Score any pending predictions whose target time has passed -----
+      // This now runs every cycle for every coin, as long as we have ANY price
+      // to compare against (fresh or last-known), so no coin gets left behind.
+      if (verified !== null) {
+        const stillPending = [];
+        cs.pending.forEach(p => {
+          if (nowMs < p.targetMs) { stillPending.push(p); return; }
+          const actual = verified;
+          const errPct = Math.abs(actual - p.predicted) / actual * 100;
+          const higherLower = actual > p.predicted ? 'HIGHER' : actual < p.predicted ? 'LOWER' : 'EXACT';
+          cs.log.unshift({ targetMs: p.targetMs, predicted: p.predicted, actual, higherLower, errPct, ts: nowMs });
+          if (cs.log.length > 1000) cs.log.pop();
+          Object.keys(cs.scores).forEach(k => {
+            if (p.models[k] === undefined) return;
+            cs.scores[k].e += Math.abs(actual - p.models[k]) / actual * 100;
+            cs.scores[k].n += 1;
+          });
+          recalcWeights(coin);
         });
-        recalcWeights(coin);
-      });
-      cs.pending = stillPending;
+        cs.pending = stillPending;
+      }
 
+      // ----- Make a fresh prediction for the next interval -----
+      // Only when we have enough real history (needs fresh price data to grow).
       const pred = predictNext(coin);
       if (pred) {
         const targetMs = nextBoundary();
@@ -281,6 +399,16 @@ const server = http.createServer((req, res) => {
   if (p === '/') return sendJSON(res, 200, { ok: true, service: 'cryptooracle-backend', updatedAt: state.updatedAt });
   if (p === '/api/health') return sendJSON(res, 200, { ok: true, updatedAt: state.updatedAt, sources: state.lastStatus });
   if (p === '/api/prices') return sendJSON(res, 200, { prices: state.lastPrices, sources: state.lastStatus, updatedAt: state.updatedAt });
+  if (p === '/api/seed') {
+    // One-time historical seeding. Protected by a token so it can't be run by
+    // random visitors. Pass ?key=YOUR_TOKEN matching the SEED_KEY env var.
+    const provided = url.searchParams.get('key') || '';
+    const expected = process.env.SEED_KEY || 'seed-cryptooracle-once';
+    if (provided !== expected) { sendJSON(res, 403, { error: 'forbidden — missing or wrong key' }); return; }
+    seedHistory().then(results => sendJSON(res, 200, { ok: true, results }))
+                 .catch(e => sendJSON(res, 500, { error: e.message }));
+    return;
+  }
   if (p.startsWith('/api/coin/')) {
     const id = decodeURIComponent(p.split('/').pop());
     const snap = coinSnapshot(id);
@@ -290,9 +418,17 @@ const server = http.createServer((req, res) => {
 });
 
 // ---------- Boot ----------
-loadState();
-server.listen(PORT, () => {
-  console.log(`[server] listening on :${PORT}`);
-  cycle();
-  setInterval(cycle, 60 * 1000);
-});
+async function boot() {
+  try {
+    await initDB();
+    await loadState();
+  } catch (e) {
+    console.error('[boot] init error:', e.message);
+  }
+  server.listen(PORT, () => {
+    console.log(`[server] listening on :${PORT} (persistence: ${USE_DB ? 'Postgres' : 'file'})`);
+    cycle();
+    setInterval(cycle, 60 * 1000);
+  });
+}
+boot();
