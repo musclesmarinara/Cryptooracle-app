@@ -387,7 +387,8 @@ function predictLinear(model, x) {
 // Train both models for a coin on its history, with an honest out-of-sample split.
 function trainModelForCoin(coin) {
   const cs = state.coins[coin];
-  const closes = cs.priceHistory.map(p => p.c);
+  if (!cs) return null;
+  const closes = (Array.isArray(cs.priceHistory) ? cs.priceHistory : []).map(p => p.c);
   if (closes.length < 80) return null;
 
   const rawX = [], dirY = [], retY = [];
@@ -439,9 +440,10 @@ function trainModelForCoin(coin) {
 // Live prediction from the trained model for the next interval.
 function mlPredict(coin) {
   const cs = state.coins[coin];
+  if (!cs) return null;
   const m = cs.mlModel;
   if (!m) return null;
-  const closes = cs.priceHistory.map(p => p.c);
+  const closes = (Array.isArray(cs.priceHistory) ? cs.priceHistory : []).map(p => p.c);
   if (closes.length < 31) return null;
   const f = featuresAt(closes, closes.length - 1);
   if (!f) return null;
@@ -481,7 +483,15 @@ async function cycle() {
     const { perCoin, status } = await fetchAllSources();
     const nowMs = Date.now();
     COINS.forEach(coin => {
+      // Guarantee this coin's state object exists and is well-formed before use.
+      // (Protects against any partial/legacy state loaded from the DB.)
+      if (!state.coins[coin]) state.coins[coin] = defaultCoinState();
       const cs = state.coins[coin];
+      if (!Array.isArray(cs.priceHistory)) cs.priceHistory = [];
+      if (!Array.isArray(cs.pending)) cs.pending = [];
+      if (!Array.isArray(cs.log)) cs.log = [];
+      if (!cs.weights) cs.weights = { sma: 0.25, rsi: 0.20, macd: 0.20, lin: 0.25, bb: 0.10 };
+      if (!cs.scores) cs.scores = { sma:{e:0,n:0}, rsi:{e:0,n:0}, macd:{e:0,n:0}, lin:{e:0,n:0}, bb:{e:0,n:0} };
       const prices = Object.values(perCoin[coin]);
 
       // Determine the price to use this cycle.
@@ -564,7 +574,7 @@ function sendJSON(res, code, obj) {
 function coinSnapshot(id) {
   const cs = state.coins[id];
   if (!cs) return null;
-  const log = cs.log;
+  const log = Array.isArray(cs.log) ? cs.log : [];
   const total = log.length;
   const higher = log.filter(r => r.higherLower === 'HIGHER').length;
   const lower = log.filter(r => r.higherLower === 'LOWER').length;
