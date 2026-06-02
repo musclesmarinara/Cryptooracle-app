@@ -1,0 +1,2 @@
+# Cryptooracle-app
+App
