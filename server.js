@@ -287,6 +287,177 @@ function predictNext(coin) {
 }
 function nextBoundary() { const ms = 15 * 60 * 1000; return Math.ceil(Date.now() / ms) * ms; }
 
+// ============================================================
+//  TRAINABLE MODEL (pure JS) — logistic reg for direction,
+//  linear reg for price. Trained on accumulated price history
+//  with an HONEST out-of-sample (train/test) split.
+//
+//  IMPORTANT — guarding against look-ahead leakage:
+//  For each historical point i, we build features using ONLY
+//  data up to and including i, and the label is the move from
+//  i to i+1. We never let future info into the features. The
+//  test set is the most recent chunk the model never trained on.
+// ============================================================
+
+// Build a feature vector at index i using only closes[0..i].
+function featuresAt(closes, i) {
+  if (i < 30) return null; // need enough history behind this point
+  const window = closes.slice(0, i + 1);
+  const cur = window[window.length - 1];
+  const ret1 = (cur - window[window.length - 2]) / window[window.length - 2];
+  const ret2 = (cur - window[window.length - 3]) / window[window.length - 3];
+  const ret3 = (cur - window[window.length - 4]) / window[window.length - 4];
+  const r = rsi(window, 14);
+  const e12 = ema(window, 12), e26 = ema(window, 26);
+  const macd = (e12 - e26) / cur;          // normalized MACD
+  const s20 = sma(window, 20) || cur;
+  const smaRel = (cur - s20) / s20;         // price vs SMA20
+  const vol = stddev(window.slice(-20)) / cur; // normalized volatility
+  return [
+    ret1 * 100,
+    ret2 * 100,
+    ret3 * 100,
+    (r - 50) / 50,
+    macd * 100,
+    smaRel * 100,
+    vol * 100
+  ];
+}
+
+const N_FEATURES = 7;
+const sigmoid = z => 1 / (1 + Math.exp(-z));
+
+// Standardize features (z-score) using training-set mean/std only.
+function computeScaler(rows) {
+  const means = new Array(N_FEATURES).fill(0);
+  const stds = new Array(N_FEATURES).fill(0);
+  rows.forEach(r => r.forEach((v, j) => { means[j] += v; }));
+  means.forEach((_, j) => means[j] /= rows.length);
+  rows.forEach(r => r.forEach((v, j) => { stds[j] += (v - means[j]) ** 2; }));
+  stds.forEach((_, j) => { stds[j] = Math.sqrt(stds[j] / rows.length) || 1; });
+  return { means, stds };
+}
+function applyScaler(row, scaler) {
+  return row.map((v, j) => (v - scaler.means[j]) / scaler.stds[j]);
+}
+
+// Train logistic regression (direction: 1=up, 0=down) via gradient descent.
+function trainLogistic(X, y, epochs = 300, lr = 0.1) {
+  const n = X.length, d = N_FEATURES;
+  let w = new Array(d).fill(0), b = 0;
+  for (let e = 0; e < epochs; e++) {
+    const gw = new Array(d).fill(0); let gb = 0;
+    for (let i = 0; i < n; i++) {
+      const z = X[i].reduce((s, v, j) => s + v * w[j], b);
+      const p = sigmoid(z);
+      const err = p - y[i];
+      for (let j = 0; j < d; j++) gw[j] += err * X[i][j];
+      gb += err;
+    }
+    for (let j = 0; j < d; j++) w[j] -= lr * gw[j] / n;
+    b -= lr * gb / n;
+  }
+  return { w, b };
+}
+function predictLogistic(model, x) {
+  return sigmoid(x.reduce((s, v, j) => s + v * model.w[j], model.b));
+}
+
+// Train linear regression (predict next-interval return %) via gradient descent.
+function trainLinear(X, y, epochs = 300, lr = 0.05) {
+  const n = X.length, d = N_FEATURES;
+  let w = new Array(d).fill(0), b = 0;
+  for (let e = 0; e < epochs; e++) {
+    const gw = new Array(d).fill(0); let gb = 0;
+    for (let i = 0; i < n; i++) {
+      const pred = X[i].reduce((s, v, j) => s + v * w[j], b);
+      const err = pred - y[i];
+      for (let j = 0; j < d; j++) gw[j] += err * X[i][j];
+      gb += err;
+    }
+    for (let j = 0; j < d; j++) w[j] -= lr * gw[j] / n;
+    b -= lr * gb / n;
+  }
+  return { w, b };
+}
+function predictLinear(model, x) {
+  return x.reduce((s, v, j) => s + v * model.w[j], model.b);
+}
+
+// Train both models for a coin on its history, with an honest out-of-sample split.
+function trainModelForCoin(coin) {
+  const cs = state.coins[coin];
+  const closes = cs.priceHistory.map(p => p.c);
+  if (closes.length < 80) return null;
+
+  const rawX = [], dirY = [], retY = [];
+  for (let i = 30; i < closes.length - 1; i++) {
+    const f = featuresAt(closes, i);
+    if (!f) continue;
+    const nextRet = (closes[i + 1] - closes[i]) / closes[i];
+    rawX.push(f);
+    dirY.push(nextRet > 0 ? 1 : 0);
+    retY.push(nextRet * 100);
+  }
+  if (rawX.length < 50) return null;
+
+  // Chronological split (no shuffle) so the test set is truly "future".
+  const split = Math.floor(rawX.length * 0.8);
+  const trainRaw = rawX.slice(0, split), testRaw = rawX.slice(split);
+  const dirTrain = dirY.slice(0, split), dirTest = dirY.slice(split);
+  const retTrain = retY.slice(0, split), retTest = retY.slice(split);
+
+  const scaler = computeScaler(trainRaw);
+  const Xtrain = trainRaw.map(r => applyScaler(r, scaler));
+  const Xtest = testRaw.map(r => applyScaler(r, scaler));
+
+  const logModel = trainLogistic(Xtrain, dirTrain);
+  const linModel = trainLinear(Xtrain, retTrain);
+
+  let correct = 0;
+  for (let i = 0; i < Xtest.length; i++) {
+    const p = predictLogistic(logModel, Xtest[i]);
+    if ((p >= 0.5 ? 1 : 0) === dirTest[i]) correct++;
+  }
+  const dirAcc = Xtest.length ? correct / Xtest.length : 0;
+
+  // Honest baseline to beat: always guessing the majority class on the test set.
+  const upRate = dirTest.reduce((a, v) => a + v, 0) / (dirTest.length || 1);
+  const baseline = Math.max(upRate, 1 - upRate);
+
+  let mae = 0;
+  for (let i = 0; i < Xtest.length; i++) mae += Math.abs(predictLinear(linModel, Xtest[i]) - retTest[i]);
+  mae = Xtest.length ? mae / Xtest.length : 0;
+
+  return {
+    trainedAt: Date.now(), nSamples: rawX.length, nTest: Xtest.length,
+    scaler, logModel, linModel,
+    testDirAcc: dirAcc, baselineAcc: baseline, testRetMae: mae
+  };
+}
+
+// Live prediction from the trained model for the next interval.
+function mlPredict(coin) {
+  const cs = state.coins[coin];
+  const m = cs.mlModel;
+  if (!m) return null;
+  const closes = cs.priceHistory.map(p => p.c);
+  if (closes.length < 31) return null;
+  const f = featuresAt(closes, closes.length - 1);
+  if (!f) return null;
+  const x = applyScaler(f, m.scaler);
+  const pUp = predictLogistic(m.logModel, x);
+  const predRetPct = predictLinear(m.linModel, x);
+  const cur = closes[closes.length - 1];
+  return {
+    direction: pUp >= 0.5 ? 'UP' : 'DOWN',
+    pUp,
+    predictedPrice: cur * (1 + predRetPct / 100),
+    testDirAcc: m.testDirAcc, baselineAcc: m.baselineAcc,
+    testRetMae: m.testRetMae, nSamples: m.nSamples, trainedAt: m.trainedAt
+  };
+}
+
 // ---------- Learning ----------
 function recalcWeights(coin) {
   const cs = state.coins[coin];
@@ -358,6 +529,19 @@ async function cycle() {
           if (cs.pending.length > 300) cs.pending = cs.pending.slice(-300);
         }
       }
+
+      // ----- Retrain the ML model periodically (at most every ~15 min/coin) -----
+      // Training is gradient descent over the full history, so we throttle it
+      // rather than running it every single cycle.
+      const RETRAIN_MS = 15 * 60 * 1000;
+      if (!cs.mlTrainedAt || (nowMs - cs.mlTrainedAt) > RETRAIN_MS) {
+        const trained = trainModelForCoin(coin);
+        if (trained) {
+          cs.mlModel = trained;
+          cs.mlTrainedAt = nowMs;
+          console.log(`[ml] ${coin} retrained on ${trained.nSamples} samples — out-of-sample dir acc ${(trained.testDirAcc*100).toFixed(1)}% (baseline ${(trained.baselineAcc*100).toFixed(1)}%)`);
+        }
+      }
     });
     state.lastStatus = status;
     state.updatedAt = nowMs;
@@ -386,6 +570,18 @@ function coinSnapshot(id) {
   const lower = log.filter(r => r.higherLower === 'LOWER').length;
   const within1 = log.filter(r => r.errPct <= 1).length;
   const avgErr = total ? log.reduce((a, r) => a + r.errPct, 0) / total : 0;
+
+  // Trained-model live prediction + honest out-of-sample metrics (null until trained)
+  const ml = mlPredict(id);
+
+  // Honest comparison: ensemble's own direction hit-rate on its scored log.
+  // (HIGHER means actual came in above prediction = ensemble said "lower than reality".)
+  // We compare each logged prediction's implied direction vs the actual move.
+  const ensembleScored = log.length;
+  // We can't recompute ensemble direction perfectly here without prior price,
+  // so we report the ensemble's within-1% rate as its quality proxy alongside
+  // the ML model's honest test accuracy. The dashboard explains both.
+
   return {
     coin: id,
     lastPrice: state.lastPrices[id] || null,
@@ -393,6 +589,17 @@ function coinSnapshot(id) {
     scores: cs.scores,
     pending: cs.pending.length,
     summary: { total, higher, lower, within1, within1Pct: total ? Math.round(within1 / total * 100) : 0, avgErr },
+    ml: ml ? {
+      direction: ml.direction,
+      probUp: Math.round(ml.pUp * 1000) / 10,           // % chance up, 1 decimal
+      predictedPrice: ml.predictedPrice,
+      testDirAccPct: Math.round(ml.testDirAcc * 1000) / 10,   // honest out-of-sample
+      baselineAccPct: Math.round(ml.baselineAcc * 1000) / 10, // bar to beat
+      beatsBaseline: ml.testDirAcc > ml.baselineAcc,
+      testRetMae: Math.round(ml.testRetMae * 1000) / 1000,
+      nSamples: ml.nSamples,
+      trainedAt: ml.trainedAt
+    } : null,
     log: log.slice(0, 100)
   };
 }
