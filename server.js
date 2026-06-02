@@ -1,23 +1,38 @@
 // ============================================================
 //  CRYPTOORACLE BACKEND — always-on 24/7 prediction engine
-//  Zero external dependencies (uses only Node.js built-ins).
 //
 //  - Fetches multi-source prices every 60 seconds
 //  - Generates 15-min-ahead predictions
 //  - Scores them when their target time arrives (even with nobody watching)
 //  - Auto-adjusts model weights from realized accuracy
-//  - Persists everything to data.json on disk
+//  - Persists everything to a Postgres database (Neon) so data survives
+//    redeploys and accumulates for model training
 //  - Exposes a small JSON API the static website reads from
+//
+//  Requires env var: DATABASE_URL  (Neon Postgres connection string)
+//  Falls back to a local file if DATABASE_URL is not set (for local dev).
 // ============================================================
 
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import pg from 'pg';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
+const DATABASE_URL = process.env.DATABASE_URL || '';
 const PORT = process.env.PORT || 3000;
+const USE_DB = !!DATABASE_URL;
+
+// Postgres connection pool (only used when DATABASE_URL is set)
+let pool = null;
+if (USE_DB) {
+  pool = new pg.Pool({
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false } // Neon requires SSL
+  });
+}
 
 const COINS = ['bitcoin', 'ethereum', 'ripple'];
 const SOURCE_SYMBOLS = {
@@ -38,22 +53,72 @@ function defaultCoinState() {
     log: []
   };
 }
-function loadState() {
-  try {
-    if (fs.existsSync(DATA_FILE)) { state = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); console.log('[state] loaded'); }
-  } catch (e) { console.warn('[state] load failed:', e.message); }
+// ---------- Persistence (Postgres via Neon, with file fallback) ----------
+// Strategy: keep the whole in-memory `state` as the working copy, and persist
+// it as a single JSONB row. This keeps all prediction/scoring/learning logic
+// unchanged while making the data durable across redeploys.
+
+async function initDB() {
+  if (!USE_DB) return;
+  // One table, one row (id=1) holding the entire state as JSONB.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_state (
+      id INTEGER PRIMARY KEY,
+      data JSONB NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT now()
+    )
+  `);
+}
+
+async function loadState() {
+  if (USE_DB) {
+    try {
+      const res = await pool.query('SELECT data FROM app_state WHERE id = 1');
+      if (res.rows.length) {
+        state = res.rows[0].data;
+        console.log('[state] loaded from Postgres');
+      } else {
+        console.log('[state] no saved row yet — starting fresh');
+      }
+    } catch (e) {
+      console.warn('[state] DB load failed:', e.message);
+    }
+  } else {
+    try {
+      if (fs.existsSync(DATA_FILE)) { state = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); console.log('[state] loaded from file'); }
+    } catch (e) { console.warn('[state] file load failed:', e.message); }
+  }
   if (!state.coins) state.coins = {};
   if (!state.lastPrices) state.lastPrices = {};
   if (!state.lastStatus) state.lastStatus = {};
   COINS.forEach(c => { if (!state.coins[c]) state.coins[c] = defaultCoinState(); });
 }
+
 let saveTimer = null;
+let saveInFlight = false;
 function saveState() {
   if (saveTimer) return;
-  saveTimer = setTimeout(() => {
+  saveTimer = setTimeout(async () => {
     saveTimer = null;
-    try { state.updatedAt = Date.now(); fs.writeFileSync(DATA_FILE, JSON.stringify(state)); }
-    catch (e) { console.warn('[state] save failed:', e.message); }
+    state.updatedAt = Date.now();
+    if (USE_DB) {
+      if (saveInFlight) return; // avoid overlapping writes
+      saveInFlight = true;
+      try {
+        await pool.query(
+          `INSERT INTO app_state (id, data, updated_at) VALUES (1, $1, now())
+           ON CONFLICT (id) DO UPDATE SET data = $1, updated_at = now()`,
+          [state]
+        );
+      } catch (e) {
+        console.warn('[state] DB save failed:', e.message);
+      } finally {
+        saveInFlight = false;
+      }
+    } else {
+      try { fs.writeFileSync(DATA_FILE, JSON.stringify(state)); }
+      catch (e) { console.warn('[state] file save failed:', e.message); }
+    }
   }, 500);
 }
 
@@ -305,9 +370,17 @@ const server = http.createServer((req, res) => {
 });
 
 // ---------- Boot ----------
-loadState();
-server.listen(PORT, () => {
-  console.log(`[server] listening on :${PORT}`);
-  cycle();
-  setInterval(cycle, 60 * 1000);
-});
+async function boot() {
+  try {
+    await initDB();
+    await loadState();
+  } catch (e) {
+    console.error('[boot] init error:', e.message);
+  }
+  server.listen(PORT, () => {
+    console.log(`[server] listening on :${PORT} (persistence: ${USE_DB ? 'Postgres' : 'file'})`);
+    cycle();
+    setInterval(cycle, 60 * 1000);
+  });
+}
+boot();
