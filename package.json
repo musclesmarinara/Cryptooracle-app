@@ -1,7 +1,7 @@
 {
   "name": "cryptooracle-backend",
-  "version": "1.0.0",
-  "description": "Always-on backend that fetches multi-source crypto prices, makes 15-min predictions, scores them, and self-adjusts model weights 24/7. Zero dependencies.",
+  "version": "2.0.0",
+  "description": "Always-on backend that fetches multi-source crypto prices, makes 15-min predictions, scores them, self-adjusts model weights 24/7, and persists everything to Postgres (Neon).",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -9,5 +9,8 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
   }
 }
