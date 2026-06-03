@@ -43,6 +43,8 @@ const SOURCE_SYMBOLS = {
 
 // Kalshi 15-minute up/down market series tickers (public market data, no auth).
 const KALSHI_BASE = 'https://api.elections.kalshi.com/trade-api/v2';
+// Series tickers, all confirmed live via the /api/kalshi-raw diagnostic:
+// BTC, ETH and XRP all return active 15-min markets with valid prices.
 const KALSHI_SERIES = {
   bitcoin:  'KXBTC15M',
   ethereum: 'KXETH15M',
@@ -388,31 +390,69 @@ function nextBoundary() { const ms = 15 * 60 * 1000; return Math.ceil(Date.now()
 // ============================================================
 
 // Build a feature vector at index i using only closes[0..i].
+// NOTE on honesty: every feature uses ONLY data up to and including index i.
+// The label (built later) is the move from i to i+1. No future info leaks in.
 function featuresAt(closes, i) {
-  if (i < 30) return null; // need enough history behind this point
+  if (i < 35) return null; // need enough history behind this point
   const window = closes.slice(0, i + 1);
   const cur = window[window.length - 1];
-  const ret1 = (cur - window[window.length - 2]) / window[window.length - 2];
-  const ret2 = (cur - window[window.length - 3]) / window[window.length - 3];
-  const ret3 = (cur - window[window.length - 4]) / window[window.length - 4];
-  const r = rsi(window, 14);
+  const at = k => window[window.length - 1 - k]; // k bars ago
+
+  // --- Momentum over several horizons (returns %) ---
+  const ret1 = (cur - at(1)) / at(1);
+  const ret2 = (cur - at(2)) / at(2);
+  const ret3 = (cur - at(3)) / at(3);
+  const ret5 = (cur - at(5)) / at(5);
+  const ret10 = (cur - at(10)) / at(10);
+
+  // --- Acceleration: is momentum speeding up or slowing? ---
+  const accel = ret1 - ((at(1) - at(2)) / at(2));
+
+  // --- Oscillators ---
+  const r14 = rsi(window, 14);
+  const r7 = rsi(window, 7);
+
+  // --- MACD (normalized) + its components ---
   const e12 = ema(window, 12), e26 = ema(window, 26);
-  const macd = (e12 - e26) / cur;          // normalized MACD
+  const macd = (e12 - e26) / cur;
+  const e9base = ema(window, 9);
+  const emaSpread = (e9base - e26) / cur; // short vs long trend
+
+  // --- Price relative to moving averages ---
   const s20 = sma(window, 20) || cur;
-  const smaRel = (cur - s20) / s20;         // price vs SMA20
-  const vol = stddev(window.slice(-20)) / cur; // normalized volatility
+  const s10 = sma(window, 10) || cur;
+  const smaRel20 = (cur - s20) / s20;
+  const smaRel10 = (cur - s10) / s10;
+
+  // --- Bollinger position: where in the band is price (−1..+1-ish) ---
+  const sd20 = stddev(window.slice(-20)) || (cur * 1e-6);
+  const bollPos = (cur - s20) / (2 * sd20);
+
+  // --- Volatility level + volatility ratio (regime change signal) ---
+  const vol20 = stddev(window.slice(-20)) / cur;
+  const vol5 = stddev(window.slice(-5)) / cur;
+  const volRatio = vol20 > 0 ? (vol5 / vol20) : 1; // >1 = vol rising
+
   return [
     ret1 * 100,
     ret2 * 100,
     ret3 * 100,
-    (r - 50) / 50,
+    ret5 * 100,
+    ret10 * 100,
+    accel * 100,
+    (r14 - 50) / 50,
+    (r7 - 50) / 50,
     macd * 100,
-    smaRel * 100,
-    vol * 100
+    emaSpread * 100,
+    smaRel20 * 100,
+    smaRel10 * 100,
+    bollPos,
+    vol20 * 100,
+    volRatio
   ];
 }
 
-const N_FEATURES = 7;
+const N_FEATURES = 15;
 const sigmoid = z => 1 / (1 + Math.exp(-z));
 
 // Standardize features (z-score) using training-set mean/std only.
@@ -430,9 +470,13 @@ function applyScaler(row, scaler) {
 }
 
 // Train logistic regression (direction: 1=up, 0=down) via gradient descent.
-function trainLogistic(X, y, epochs = 300, lr = 0.1) {
+// L2 regularization (lambda) penalizes large weights → less overfitting, which
+// matters now that we feed it more features. warmStart lets it resume from prior
+// weights instead of starting cold, so retraining converges faster and smoother.
+function trainLogistic(X, y, epochs = 400, lr = 0.1, lambda = 0.01, warmStart = null) {
   const n = X.length, d = N_FEATURES;
-  let w = new Array(d).fill(0), b = 0;
+  let w = (warmStart && warmStart.w && warmStart.w.length === d) ? warmStart.w.slice() : new Array(d).fill(0);
+  let b = (warmStart && typeof warmStart.b === 'number') ? warmStart.b : 0;
   for (let e = 0; e < epochs; e++) {
     const gw = new Array(d).fill(0); let gb = 0;
     for (let i = 0; i < n; i++) {
@@ -442,7 +486,7 @@ function trainLogistic(X, y, epochs = 300, lr = 0.1) {
       for (let j = 0; j < d; j++) gw[j] += err * X[i][j];
       gb += err;
     }
-    for (let j = 0; j < d; j++) w[j] -= lr * gw[j] / n;
+    for (let j = 0; j < d; j++) w[j] -= lr * (gw[j] / n + lambda * w[j]);
     b -= lr * gb / n;
   }
   return { w, b };
@@ -452,9 +496,10 @@ function predictLogistic(model, x) {
 }
 
 // Train linear regression (predict next-interval return %) via gradient descent.
-function trainLinear(X, y, epochs = 300, lr = 0.05) {
+function trainLinear(X, y, epochs = 400, lr = 0.05, lambda = 0.01, warmStart = null) {
   const n = X.length, d = N_FEATURES;
-  let w = new Array(d).fill(0), b = 0;
+  let w = (warmStart && warmStart.w && warmStart.w.length === d) ? warmStart.w.slice() : new Array(d).fill(0);
+  let b = (warmStart && typeof warmStart.b === 'number') ? warmStart.b : 0;
   for (let e = 0; e < epochs; e++) {
     const gw = new Array(d).fill(0); let gb = 0;
     for (let i = 0; i < n; i++) {
@@ -463,7 +508,7 @@ function trainLinear(X, y, epochs = 300, lr = 0.05) {
       for (let j = 0; j < d; j++) gw[j] += err * X[i][j];
       gb += err;
     }
-    for (let j = 0; j < d; j++) w[j] -= lr * gw[j] / n;
+    for (let j = 0; j < d; j++) w[j] -= lr * (gw[j] / n + lambda * w[j]);
     b -= lr * gb / n;
   }
   return { w, b };
@@ -477,10 +522,10 @@ function trainModelForCoin(coin) {
   const cs = state.coins[coin];
   if (!cs) return null;
   const closes = (Array.isArray(cs.priceHistory) ? cs.priceHistory : []).map(p => p.c);
-  if (closes.length < 80) return null;
+  if (closes.length < 90) return null;
 
   const rawX = [], dirY = [], retY = [];
-  for (let i = 30; i < closes.length - 1; i++) {
+  for (let i = 35; i < closes.length - 1; i++) {
     const f = featuresAt(closes, i);
     if (!f) continue;
     const nextRet = (closes[i + 1] - closes[i]) / closes[i];
@@ -488,7 +533,7 @@ function trainModelForCoin(coin) {
     dirY.push(nextRet > 0 ? 1 : 0);
     retY.push(nextRet * 100);
   }
-  if (rawX.length < 50) return null;
+  if (rawX.length < 60) return null;
 
   // Chronological split (no shuffle) so the test set is truly "future".
   const split = Math.floor(rawX.length * 0.8);
@@ -500,15 +545,30 @@ function trainModelForCoin(coin) {
   const Xtrain = trainRaw.map(r => applyScaler(r, scaler));
   const Xtest = testRaw.map(r => applyScaler(r, scaler));
 
-  const logModel = trainLogistic(Xtrain, dirTrain);
-  const linModel = trainLinear(Xtrain, retTrain);
+  // Warm-start from the previous model if its shape matches (faster convergence).
+  const prev = cs.mlModel;
+  const warmLog = (prev && prev.logModel && prev.logModel.w && prev.logModel.w.length === N_FEATURES) ? prev.logModel : null;
+  const warmLin = (prev && prev.linModel && prev.linModel.w && prev.linModel.w.length === N_FEATURES) ? prev.linModel : null;
 
+  const logModel = trainLogistic(Xtrain, dirTrain, 400, 0.1, 0.01, warmLog);
+  const linModel = trainLinear(Xtrain, retTrain, 400, 0.05, 0.01, warmLin);
+
+  // Out-of-sample direction accuracy (the number that actually matters).
   let correct = 0;
   for (let i = 0; i < Xtest.length; i++) {
     const p = predictLogistic(logModel, Xtest[i]);
     if ((p >= 0.5 ? 1 : 0) === dirTest[i]) correct++;
   }
   const dirAcc = Xtest.length ? correct / Xtest.length : 0;
+
+  // In-sample (training) accuracy — used ONLY to detect overfitting. If this is
+  // much higher than the test accuracy, the model is memorizing noise.
+  let trCorrect = 0;
+  for (let i = 0; i < Xtrain.length; i++) {
+    const p = predictLogistic(logModel, Xtrain[i]);
+    if ((p >= 0.5 ? 1 : 0) === dirTrain[i]) trCorrect++;
+  }
+  const trainDirAcc = Xtrain.length ? trCorrect / Xtrain.length : 0;
 
   // Honest baseline to beat: always guessing the majority class on the test set.
   const upRate = dirTest.reduce((a, v) => a + v, 0) / (dirTest.length || 1);
@@ -519,9 +579,10 @@ function trainModelForCoin(coin) {
   mae = Xtest.length ? mae / Xtest.length : 0;
 
   return {
-    trainedAt: Date.now(), nSamples: rawX.length, nTest: Xtest.length,
+    trainedAt: Date.now(), nSamples: rawX.length, nTest: Xtest.length, nFeatures: N_FEATURES,
     scaler, logModel, linModel,
-    testDirAcc: dirAcc, baselineAcc: baseline, testRetMae: mae
+    testDirAcc: dirAcc, trainDirAcc, baselineAcc: baseline, testRetMae: mae,
+    overfitGap: trainDirAcc - dirAcc
   };
 }
 
@@ -544,6 +605,7 @@ function mlPredict(coin) {
     pUp,
     predictedPrice: cur * (1 + predRetPct / 100),
     testDirAcc: m.testDirAcc, baselineAcc: m.baselineAcc,
+    trainDirAcc: m.trainDirAcc, overfitGap: m.overfitGap, nFeatures: m.nFeatures,
     testRetMae: m.testRetMae, nSamples: m.nSamples, trainedAt: m.trainedAt
   };
 }
@@ -685,7 +747,7 @@ async function cycle() {
       // ----- Retrain the ML model periodically (at most every ~15 min/coin) -----
       // Training is gradient descent over the full history, so we throttle it
       // rather than running it every single cycle.
-      const RETRAIN_MS = 15 * 60 * 1000;
+      const RETRAIN_MS = 5 * 60 * 1000;
       if (!cs.mlTrainedAt || (nowMs - cs.mlTrainedAt) > RETRAIN_MS) {
         const trained = trainModelForCoin(coin);
         if (trained) {
@@ -773,6 +835,9 @@ function coinSnapshot(id) {
       testDirAccPct: Math.round(ml.testDirAcc * 1000) / 10,   // honest out-of-sample
       baselineAccPct: Math.round(ml.baselineAcc * 1000) / 10, // bar to beat
       beatsBaseline: ml.testDirAcc > ml.baselineAcc,
+      trainDirAccPct: ml.trainDirAcc != null ? Math.round(ml.trainDirAcc * 1000) / 10 : null, // in-sample (for overfit check)
+      overfitGapPct: ml.overfitGap != null ? Math.round(ml.overfitGap * 1000) / 10 : null,    // train minus test; big = overfitting
+      nFeatures: ml.nFeatures || null,
       testRetMae: Math.round(ml.testRetMae * 1000) / 1000,
       nSamples: ml.nSamples,
       trainedAt: ml.trainedAt
