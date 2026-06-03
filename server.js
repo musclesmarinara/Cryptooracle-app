@@ -41,6 +41,14 @@ const SOURCE_SYMBOLS = {
   ripple:   { binance: 'XRPUSDT', coinbase: 'XRP-USD', kraken: 'XRPUSD' }
 };
 
+// Kalshi 15-minute up/down market series tickers (public market data, no auth).
+const KALSHI_BASE = 'https://api.elections.kalshi.com/trade-api/v2';
+const KALSHI_SERIES = {
+  bitcoin:  'KXBTC15M',
+  ethereum: 'KXETH15M',
+  ripple:   'KXXRP15M'
+};
+
 // ---------- Persistent State ----------
 let state = { coins: {}, lastPrices: {}, lastStatus: {}, updatedAt: null };
 
@@ -192,6 +200,51 @@ async function fetchAllSources() {
     } else status[name] = 'fail';
   });
   return { perCoin, status };
+}
+
+// ---------- Kalshi prediction-market data (public, no auth) ----------
+// Reads the 15-minute up/down market for each coin and extracts the market's
+// implied probability of "up". Purely for comparison — we never trade.
+// NOTE: Kalshi may rate-limit or geo-block cloud IPs; if so this returns null
+// and the dashboard simply shows "market data unavailable".
+async function fetchKalshi() {
+  const out = {};
+  for (const coin of COINS) {
+    out[coin] = null;
+    try {
+      const series = KALSHI_SERIES[coin];
+      // Get markets in this series that are open, soonest close first.
+      const url = `${KALSHI_BASE}/markets?series_ticker=${series}&status=open&limit=100`;
+      const r = await timedFetch(url, 9000);
+      if (!r.ok) { out[coin] = { error: 'kalshi ' + r.status }; continue; }
+      const d = await r.json();
+      const markets = d.markets || [];
+      if (!markets.length) { out[coin] = { error: 'no open markets' }; continue; }
+      // Pick the market closing soonest in the future (the next 15-min interval).
+      const now = Date.now();
+      const upcoming = markets
+        .map(m => ({ m, closeMs: Date.parse(m.close_time || m.expiration_time || 0) }))
+        .filter(x => x.closeMs > now)
+        .sort((a, b) => a.closeMs - b.closeMs);
+      if (!upcoming.length) { out[coin] = { error: 'no upcoming' }; continue; }
+      const pick = upcoming[0].m;
+      // Kalshi prices are in cents (0-100). yes_bid/yes_ask/last_price represent
+      // the implied probability of YES (which for these markets = "up").
+      const yesPrice = (pick.last_price ?? pick.yes_bid ?? pick.yes_ask);
+      const probUp = (typeof yesPrice === 'number') ? yesPrice / 100 : null;
+      out[coin] = {
+        ticker: pick.ticker,
+        title: pick.title || pick.subtitle || '',
+        closeMs: upcoming[0].closeMs,
+        probUp,                                   // 0..1, market's chance of "up"
+        marketDir: probUp == null ? null : (probUp >= 0.5 ? 'UP' : 'DOWN'),
+        volume: pick.volume ?? null
+      };
+    } catch (e) {
+      out[coin] = { error: e.message };
+    }
+  }
+  return out;
 }
 
 // ---------- One-time historical seeding (Kraken 15-min candles) ----------
@@ -481,6 +534,8 @@ function recalcWeights(coin) {
 async function cycle() {
   try {
     const { perCoin, status } = await fetchAllSources();
+    const kalshi = await fetchKalshi();   // public market data for comparison
+    state.kalshi = kalshi;
     const nowMs = Date.now();
     COINS.forEach(coin => {
       // Guarantee this coin's state object exists and is well-formed before use.
@@ -540,6 +595,58 @@ async function cycle() {
         }
       }
 
+      // ----- THREE-WAY COMPARISON: market vs ensemble vs AI -----
+      // Lock in all three direction calls for the next boundary (only once each),
+      // then score them together when that boundary's actual price is known.
+      if (!Array.isArray(cs.compare)) cs.compare = [];
+      if (!cs.compareScore) cs.compareScore = { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0} };
+
+      // (a) Score any locked comparisons whose target has passed.
+      if (verified !== null) {
+        const keep = [];
+        cs.compare.forEach(c => {
+          if (nowMs < c.targetMs) { keep.push(c); return; }
+          if (c.scored) { keep.push(c); return; }
+          const actualDir = verified > c.priceAtLock ? 'UP' : verified < c.priceAtLock ? 'DOWN' : 'FLAT';
+          c.actualDir = actualDir;
+          c.actualPrice = verified;
+          c.scored = true;
+          // Tally correctness for each predictor that made a call.
+          [['market', c.marketDir], ['ensemble', c.ensembleDir], ['ai', c.aiDir]].forEach(([k, dir]) => {
+            if (!dir || actualDir === 'FLAT') return;
+            cs.compareScore[k].n += 1;
+            if (dir === actualDir) cs.compareScore[k].c += 1;
+          });
+          keep.unshift(c); // keep scored ones at the front (recent history)
+        });
+        // Keep a bounded history of scored comparisons + all still-pending ones.
+        cs.compare = keep.slice(0, 500);
+      }
+
+      // (b) Lock in a new comparison for the next boundary if not already locked.
+      if (verified !== null && pred) {
+        const targetMs = nextBoundary();
+        if (!cs.compare.some(c => c.targetMs === targetMs)) {
+          // Ensemble direction: predicted price vs current price.
+          const ensembleDir = pred.predicted > verified ? 'UP' : pred.predicted < verified ? 'DOWN' : 'FLAT';
+          // AI direction: from the trained model, if available.
+          const ml = mlPredict(coin);
+          const aiDir = ml ? ml.direction : null;
+          // Market direction: from Kalshi, if available.
+          const km = kalshi[coin];
+          const marketDir = (km && km.marketDir) ? km.marketDir : null;
+          cs.compare.unshift({
+            targetMs,
+            priceAtLock: verified,
+            marketDir, marketProbUp: (km && typeof km.probUp === 'number') ? km.probUp : null,
+            ensembleDir, ensemblePredicted: pred.predicted,
+            aiDir, aiProbUp: ml ? ml.pUp : null,
+            scored: false, lockedAt: nowMs
+          });
+          cs.compare = cs.compare.slice(0, 500);
+        }
+      }
+
       // ----- Retrain the ML model periodically (at most every ~15 min/coin) -----
       // Training is gradient descent over the full history, so we throttle it
       // rather than running it every single cycle.
@@ -581,6 +688,31 @@ function coinSnapshot(id) {
   const within1 = log.filter(r => r.errPct <= 1).length;
   const avgErr = total ? log.reduce((a, r) => a + r.errPct, 0) / total : 0;
 
+  // ----- Live in-block readout -----
+  // The OFFICIAL prediction for the current 15-min block is locked (it's the
+  // pending entry for the upcoming boundary). Within the block we also report
+  // how the live price is tracking versus that locked prediction — this updates
+  // every cycle without changing the locked call.
+  const ms = 15 * 60 * 1000;
+  const curBoundary = Math.ceil(Date.now() / ms) * ms;
+  const lockedPending = Array.isArray(cs.pending) ? cs.pending.find(p => p.targetMs === curBoundary) : null;
+  const livePrice = state.lastPrices[id]?.verified ?? null;
+  let live = null;
+  if (lockedPending) {
+    const minsLeft = Math.max(0, Math.round((curBoundary - Date.now()) / 60000));
+    live = {
+      targetMs: curBoundary,
+      minutesLeft: minsLeft,
+      lockedPredicted: lockedPending.predicted,
+      lockedAtPrice: lockedPending.priceAtPrediction,
+      lockedDir: lockedPending.predicted > lockedPending.priceAtPrediction ? 'UP' : lockedPending.predicted < lockedPending.priceAtPrediction ? 'DOWN' : 'FLAT',
+      livePrice,
+      // How the live price is currently tracking vs the locked prediction:
+      trackingDir: (livePrice != null) ? (livePrice > lockedPending.priceAtPrediction ? 'UP' : livePrice < lockedPending.priceAtPrediction ? 'DOWN' : 'FLAT') : null,
+      gapToPredicted: (livePrice != null) ? (lockedPending.predicted - livePrice) : null
+    };
+  }
+
   // Trained-model live prediction + honest out-of-sample metrics (null until trained)
   const ml = mlPredict(id);
 
@@ -610,7 +742,15 @@ function coinSnapshot(id) {
       nSamples: ml.nSamples,
       trainedAt: ml.trainedAt
     } : null,
-    log: log.slice(0, 100)
+    log: log.slice(0, 100),
+    live,
+    // Three-way comparison: market (Kalshi) vs ensemble vs AI
+    compare: {
+      latest: (Array.isArray(cs.compare) && cs.compare.length) ? cs.compare[0] : null,
+      recent: Array.isArray(cs.compare) ? cs.compare.filter(c => c.scored).slice(0, 30) : [],
+      score: cs.compareScore || { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0} },
+      kalshi: (state.kalshi && state.kalshi[id]) ? state.kalshi[id] : null
+    }
   };
 }
 
