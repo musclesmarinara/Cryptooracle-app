@@ -784,7 +784,12 @@ function coinSnapshot(id) {
       latest: (Array.isArray(cs.compare) && cs.compare.length) ? cs.compare[0] : null,
       recent: Array.isArray(cs.compare) ? cs.compare.filter(c => c.scored).slice(0, 30) : [],
       score: cs.compareScore || { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0} },
-      kalshi: (state.kalshi && state.kalshi[id]) ? state.kalshi[id] : null
+      kalshi: (() => {
+        const k = (state.kalshi && state.kalshi[id]) ? { ...state.kalshi[id] } : {};
+        const lp = state.lastPrices && state.lastPrices[id] ? state.lastPrices[id].verified : null;
+        if (lp != null) k.livePrice = lp;   // coin's current spot price, for the market card
+        return k;
+      })()
     }
   };
 }
@@ -797,24 +802,36 @@ const server = http.createServer((req, res) => {
   if (p === '/api/health') return sendJSON(res, 200, { ok: true, updatedAt: state.updatedAt, sources: state.lastStatus });
   if (p === '/api/prices') return sendJSON(res, 200, { prices: state.lastPrices, sources: state.lastStatus, updatedAt: state.updatedAt });
   if (p === '/api/kalshi-raw') {
-    // Diagnostic: dump the raw fields of the soonest BTC 15-min market so we can
-    // see exactly which price field Kalshi uses. Safe (public data, read-only).
+    // Diagnostic: for EACH coin, show the soonest market's key price fields so we
+    // can see exactly what ETH and XRP return vs BTC. Safe (public, read-only).
     (async () => {
-      try {
-        const series = KALSHI_SERIES.bitcoin;
-        const r = await timedFetch(`${KALSHI_BASE}/markets?series_ticker=${series}&status=open&limit=20`, 9000);
-        if (!r.ok) { sendJSON(res, 200, { error: 'kalshi ' + r.status }); return; }
-        const d = await r.json();
-        const markets = d.markets || [];
-        const now = Date.now();
-        const upcoming = markets
-          .map(m => ({ m, closeMs: Date.parse(m.close_time || m.expiration_time || 0) }))
-          .filter(x => x.closeMs > now)
-          .sort((a, b) => a.closeMs - b.closeMs);
-        const pick = upcoming.length ? upcoming[0].m : (markets[0] || null);
-        // Return the FULL raw market object so we can read the actual field names.
-        sendJSON(res, 200, { count: markets.length, rawMarket: pick, allKeys: pick ? Object.keys(pick) : [] });
-      } catch (e) { sendJSON(res, 200, { error: e.message }); }
+      const result = {};
+      for (const coin of COINS) {
+        try {
+          const series = KALSHI_SERIES[coin];
+          const r = await timedFetch(`${KALSHI_BASE}/markets?series_ticker=${series}&status=open&limit=20`, 9000);
+          if (!r.ok) { result[coin] = { series, error: 'kalshi ' + r.status }; continue; }
+          const d = await r.json();
+          const markets = d.markets || [];
+          const now = Date.now();
+          const upcoming = markets
+            .map(m => ({ m, closeMs: Date.parse(m.close_time || m.expiration_time || 0) }))
+            .filter(x => x.closeMs > now)
+            .sort((a, b) => a.closeMs - b.closeMs);
+          const pick = upcoming.length ? upcoming[0].m : (markets[0] || null);
+          result[coin] = {
+            series,
+            count: markets.length,
+            ticker: pick ? pick.ticker : null,
+            status: pick ? pick.status : null,
+            last_price_dollars: pick ? pick.last_price_dollars : null,
+            yes_bid_dollars: pick ? pick.yes_bid_dollars : null,
+            yes_ask_dollars: pick ? pick.yes_ask_dollars : null,
+            volume_fp: pick ? pick.volume_fp : null
+          };
+        } catch (e) { result[coin] = { error: e.message }; }
+      }
+      sendJSON(res, 200, result);
     })();
     return;
   }
