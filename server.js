@@ -269,10 +269,13 @@ async function fetchKalshi() {
       else if (yesBid != null && yesBid > 0) probUp = yesBid;
       else if (yesAsk != null && yesAsk > 0) probUp = yesAsk;
 
-      // The strike is the absolute price level the market grades against
-      // ("resolves YES if price >= strike"). Capturing it lets our models answer
-      // the exact same question Kalshi asks, instead of a generic up/down.
+      // The strike is the absolute price level the market grades against. Most
+      // 15-min markets are "greater_or_equal" (YES = price AT/ABOVE strike), but
+      // capture the type so a "below"-type market isn't interpreted backwards.
       const strike = num(pick.floor_strike) ?? num(pick.cap_strike) ?? null;
+      // strikeAbove = true means YES resolves when price >= strike (the usual case).
+      const st = (pick.strike_type || '').toLowerCase();
+      const strikeAbove = st.includes('less') ? false : true; // 'less'/'less_or_equal' => YES is below
       out[coin] = {
         ticker: pick.ticker,
         title: pick.title || pick.yes_sub_title || pick.subtitle || '',
@@ -280,6 +283,7 @@ async function fetchKalshi() {
         probUp,                                   // 0..1, market's chance of "up"
         marketDir: probUp == null ? null : (probUp >= 0.5 ? 'UP' : 'DOWN'),
         strike,                                   // absolute price level for YES
+        strikeAbove,                              // true: YES = price >= strike
         volume: num(pick.volume_fp) ?? num(pick.volume) ?? null
       };
     } catch (e) {
@@ -738,9 +742,17 @@ async function cycle() {
             : verified;
 
           // Grade against the strike if we locked one (same question as the market);
-          // otherwise grade vs the price at lock (old behavior).
+          // otherwise grade vs the price at lock (old behavior). UP = the YES side.
           const ref = (typeof c.strike === 'number') ? c.strike : c.priceAtLock;
-          const actualDir = settle > ref ? 'UP' : settle < ref ? 'DOWN' : 'FLAT';
+          const above = settle > ref;
+          let actualDir;
+          if (settle === ref) actualDir = 'FLAT';
+          else if (typeof c.strike === 'number') {
+            const sa = c.strikeAbove !== false; // default YES = above
+            actualDir = (above === sa) ? 'UP' : 'DOWN';
+          } else {
+            actualDir = above ? 'UP' : 'DOWN';
+          }
           c.actualDir = actualDir;
           c.actualPrice = settle;        // the averaged settlement value we graded on
           c.gradedVs = (typeof c.strike === 'number') ? 'strike' : 'priceAtLock';
@@ -805,19 +817,30 @@ async function cycle() {
           const km = kalshi[coin];
           const ml = mlPredict(coin);
           // If Kalshi gives us the strike (absolute level it grades against), all
-          // three predictors answer the SAME question: "will price be >= strike at
-          // close?" UP = YES (>= strike), DOWN = NO (< strike). If no strike is
-          // available, fall back to the old "vs current price" direction.
+          // three predictors answer the SAME question Kalshi poses, e.g.
+          // "will BTC be >= $68,800 at close?". We define UP = the YES side of that
+          // market. For the usual "greater_or_equal" market YES = price >= strike;
+          // for a "less" market YES = price <= strike. If no strike, fall back to
+          // generic direction vs current price.
           const strike = (km && typeof km.strike === 'number') ? km.strike : null;
+          const strikeAbove = !km || km.strikeAbove !== false; // default: YES = above
           const ref = strike != null ? strike : verified;
+          // Map a predicted price to a YES/NO (UP/DOWN) call given the strike sense.
+          const dirVsStrike = (price) => {
+            if (price === ref) return 'FLAT';
+            const above = price > ref;
+            // YES (UP) when above & strikeAbove, or below & !strikeAbove.
+            return (above === strikeAbove) ? 'UP' : 'DOWN';
+          };
 
           // Ensemble: its predicted price vs the reference (strike or current).
-          const ensembleDir = pred.predicted > ref ? 'UP' : pred.predicted < ref ? 'DOWN' : 'FLAT';
+          const ensembleDir = strike != null ? dirVsStrike(pred.predicted)
+            : (pred.predicted > ref ? 'UP' : pred.predicted < ref ? 'DOWN' : 'FLAT');
           // AI: prefer its predicted price vs strike; without a strike use its own direction call.
           let aiDir = null;
           if (ml) {
             aiDir = (strike != null && typeof ml.predictedPrice === 'number')
-              ? (ml.predictedPrice > strike ? 'UP' : ml.predictedPrice < strike ? 'DOWN' : 'FLAT')
+              ? dirVsStrike(ml.predictedPrice)
               : ml.direction;
           }
           // Market: Kalshi's own implied call (YES if probUp >= 0.5).
@@ -881,6 +904,7 @@ async function cycle() {
             targetMs,
             priceAtLock: verified,
             strike,                               // the level we'll grade against (null = vs priceAtLock)
+            strikeAbove,                          // true: YES = price >= strike
             marketDir, marketProbUp: (km && typeof km.probUp === 'number') ? km.probUp : null,
             ensembleDir, ensemblePredicted: pred.predicted,
             aiDir, aiProbUp: ml ? ml.pUp : null, aiPredicted: ml ? ml.predictedPrice : null,
