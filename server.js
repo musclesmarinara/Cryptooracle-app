@@ -228,26 +228,43 @@ async function fetchKalshi() {
         .sort((a, b) => a.closeMs - b.closeMs);
       if (!upcoming.length) { out[coin] = { error: 'no upcoming' }; continue; }
       const pick = upcoming[0].m;
-      // Kalshi is migrating from integer-cents fields (yes_bid=64) to _dollars
-      // fields (yes_bid_dollars=0.64). Support BOTH, and fall back through
-      // last price -> mid of bid/ask -> bid -> ask. Fresh 15-min markets often
-      // have no last trade yet, so the bid/ask midpoint is the best estimate.
       const num = v => (typeof v === 'number' && isFinite(v)) ? v : null;
-      // Normalize any field to a 0..1 probability.
       const asProb = (dollars, cents) => {
-        const d = num(dollars); if (d != null) return d > 1 ? d / 100 : d; // _dollars is 0..1 (sometimes given as 0..100)
+        const d = num(dollars); if (d != null) return d > 1 ? d / 100 : d;
         const c = num(cents);   if (c != null) return c / 100;
         return null;
       };
       const lastP = asProb(pick.last_price_dollars, pick.last_price);
-      const yesBid = asProb(pick.yes_bid_dollars, pick.yes_bid);
-      const yesAsk = asProb(pick.yes_ask_dollars, pick.yes_ask);
+      let yesBid = asProb(pick.yes_bid_dollars, pick.yes_bid);
+      let yesAsk = asProb(pick.yes_ask_dollars, pick.yes_ask);
+
+      // The /markets list often returns 0/empty bid-ask for fast 15-min markets.
+      // Pull the market's orderbook directly — that's where the live resting
+      // bid/ask actually live for actively traded markets.
+      if ((yesBid == null || yesBid === 0) && (yesAsk == null || yesAsk === 0) && (lastP == null || lastP === 0)) {
+        try {
+          const obr = await timedFetch(`${KALSHI_BASE}/markets/${pick.ticker}/orderbook`, 8000);
+          if (obr.ok) {
+            const obd = await obr.json();
+            const ob = obd.orderbook || obd.orderbook_fp || obd || {};
+            // yes[]/no[] are arrays of [price, size]; best level is the last entry.
+            const yesLevels = ob.yes || ob.yes_dollars || [];
+            const noLevels  = ob.no  || ob.no_dollars  || [];
+            const toProb = x => x == null ? null : (x > 1 ? x / 100 : x);
+            const bestYes = yesLevels.length ? toProb(yesLevels[yesLevels.length - 1][0]) : null;
+            const bestNo  = noLevels.length  ? toProb(noLevels[noLevels.length - 1][0])   : null;
+            if (bestYes != null) yesBid = bestYes;
+            if (bestNo != null)  yesAsk = 1 - bestNo; // No bid at p == Yes ask at (1-p)
+          }
+        } catch {}
+      }
+
       let probUp = null;
       if (lastP != null && lastP > 0 && lastP < 1) probUp = lastP;
-      else if (yesBid != null && yesAsk != null) probUp = (yesBid + yesAsk) / 2;
-      else if (yesBid != null) probUp = yesBid;
-      else if (yesAsk != null) probUp = yesAsk;
-      else if (lastP != null) probUp = lastP; // 0 or 1 edge cases
+      else if (yesBid != null && yesAsk != null && (yesBid > 0 || yesAsk > 0)) probUp = (yesBid + yesAsk) / 2;
+      else if (yesBid != null && yesBid > 0) probUp = yesBid;
+      else if (yesAsk != null && yesAsk > 0) probUp = yesAsk;
+
       out[coin] = {
         ticker: pick.ticker,
         title: pick.title || pick.subtitle || '',
@@ -777,6 +794,28 @@ const server = http.createServer((req, res) => {
   if (p === '/') return sendJSON(res, 200, { ok: true, service: 'cryptooracle-backend', updatedAt: state.updatedAt });
   if (p === '/api/health') return sendJSON(res, 200, { ok: true, updatedAt: state.updatedAt, sources: state.lastStatus });
   if (p === '/api/prices') return sendJSON(res, 200, { prices: state.lastPrices, sources: state.lastStatus, updatedAt: state.updatedAt });
+  if (p === '/api/kalshi-raw') {
+    // Diagnostic: dump the raw fields of the soonest BTC 15-min market so we can
+    // see exactly which price field Kalshi uses. Safe (public data, read-only).
+    (async () => {
+      try {
+        const series = KALSHI_SERIES.bitcoin;
+        const r = await timedFetch(`${KALSHI_BASE}/markets?series_ticker=${series}&status=open&limit=20`, 9000);
+        if (!r.ok) { sendJSON(res, 200, { error: 'kalshi ' + r.status }); return; }
+        const d = await r.json();
+        const markets = d.markets || [];
+        const now = Date.now();
+        const upcoming = markets
+          .map(m => ({ m, closeMs: Date.parse(m.close_time || m.expiration_time || 0) }))
+          .filter(x => x.closeMs > now)
+          .sort((a, b) => a.closeMs - b.closeMs);
+        const pick = upcoming.length ? upcoming[0].m : (markets[0] || null);
+        // Return the FULL raw market object so we can read the actual field names.
+        sendJSON(res, 200, { count: markets.length, rawMarket: pick, allKeys: pick ? Object.keys(pick) : [] });
+      } catch (e) { sendJSON(res, 200, { error: e.message }); }
+    })();
+    return;
+  }
   if (p === '/api/seed') {
     // One-time historical seeding. Protected by a token so it can't be run by
     // random visitors. Pass ?key=YOUR_TOKEN matching the SEED_KEY env var.
