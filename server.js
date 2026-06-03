@@ -269,12 +269,17 @@ async function fetchKalshi() {
       else if (yesBid != null && yesBid > 0) probUp = yesBid;
       else if (yesAsk != null && yesAsk > 0) probUp = yesAsk;
 
+      // The strike is the absolute price level the market grades against
+      // ("resolves YES if price >= strike"). Capturing it lets our models answer
+      // the exact same question Kalshi asks, instead of a generic up/down.
+      const strike = num(pick.floor_strike) ?? num(pick.cap_strike) ?? null;
       out[coin] = {
         ticker: pick.ticker,
         title: pick.title || pick.yes_sub_title || pick.subtitle || '',
         closeMs: upcoming[0].closeMs,
         probUp,                                   // 0..1, market's chance of "up"
         marketDir: probUp == null ? null : (probUp >= 0.5 ? 'UP' : 'DOWN'),
+        strike,                                   // absolute price level for YES
         volume: num(pick.volume_fp) ?? num(pick.volume) ?? null
       };
     } catch (e) {
@@ -704,9 +709,23 @@ async function cycle() {
         cs.compare.forEach(c => {
           if (nowMs < c.targetMs) { keep.push(c); return; }
           if (c.scored) { keep.push(c); return; }
-          const actualDir = verified > c.priceAtLock ? 'UP' : verified < c.priceAtLock ? 'DOWN' : 'FLAT';
+
+          // Kalshi grades on the AVERAGE of the final ~60 seconds of price, not a
+          // single tick. Approximate that by averaging our recorded prices within
+          // the last 90s before the target; fall back to the latest price.
+          const hist = Array.isArray(cs.priceHistory) ? cs.priceHistory : [];
+          const windowPts = hist.filter(p => p.t >= c.targetMs - 90000 && p.t <= c.targetMs + 5000);
+          const settle = windowPts.length
+            ? windowPts.reduce((a, p) => a + p.c, 0) / windowPts.length
+            : verified;
+
+          // Grade against the strike if we locked one (same question as the market);
+          // otherwise grade vs the price at lock (old behavior).
+          const ref = (typeof c.strike === 'number') ? c.strike : c.priceAtLock;
+          const actualDir = settle > ref ? 'UP' : settle < ref ? 'DOWN' : 'FLAT';
           c.actualDir = actualDir;
-          c.actualPrice = verified;
+          c.actualPrice = settle;        // the averaged settlement value we graded on
+          c.gradedVs = (typeof c.strike === 'number') ? 'strike' : 'priceAtLock';
           c.scored = true;
           // Tally correctness for each predictor that made a call.
           [['market', c.marketDir], ['ensemble', c.ensembleDir], ['ai', c.aiDir]].forEach(([k, dir]) => {
@@ -724,20 +743,34 @@ async function cycle() {
       if (verified !== null && pred) {
         const targetMs = nextBoundary();
         if (!cs.compare.some(c => c.targetMs === targetMs)) {
-          // Ensemble direction: predicted price vs current price.
-          const ensembleDir = pred.predicted > verified ? 'UP' : pred.predicted < verified ? 'DOWN' : 'FLAT';
-          // AI direction: from the trained model, if available.
-          const ml = mlPredict(coin);
-          const aiDir = ml ? ml.direction : null;
-          // Market direction: from Kalshi, if available.
           const km = kalshi[coin];
+          const ml = mlPredict(coin);
+          // If Kalshi gives us the strike (absolute level it grades against), all
+          // three predictors answer the SAME question: "will price be >= strike at
+          // close?" UP = YES (>= strike), DOWN = NO (< strike). If no strike is
+          // available, fall back to the old "vs current price" direction.
+          const strike = (km && typeof km.strike === 'number') ? km.strike : null;
+          const ref = strike != null ? strike : verified;
+
+          // Ensemble: its predicted price vs the reference (strike or current).
+          const ensembleDir = pred.predicted > ref ? 'UP' : pred.predicted < ref ? 'DOWN' : 'FLAT';
+          // AI: prefer its predicted price vs strike; without a strike use its own direction call.
+          let aiDir = null;
+          if (ml) {
+            aiDir = (strike != null && typeof ml.predictedPrice === 'number')
+              ? (ml.predictedPrice > strike ? 'UP' : ml.predictedPrice < strike ? 'DOWN' : 'FLAT')
+              : ml.direction;
+          }
+          // Market: Kalshi's own implied call (YES if probUp >= 0.5).
           const marketDir = (km && km.marketDir) ? km.marketDir : null;
+
           cs.compare.unshift({
             targetMs,
             priceAtLock: verified,
+            strike,                               // the level we'll grade against (null = vs priceAtLock)
             marketDir, marketProbUp: (km && typeof km.probUp === 'number') ? km.probUp : null,
             ensembleDir, ensemblePredicted: pred.predicted,
-            aiDir, aiProbUp: ml ? ml.pUp : null,
+            aiDir, aiProbUp: ml ? ml.pUp : null, aiPredicted: ml ? ml.predictedPrice : null,
             scored: false, lockedAt: nowMs
           });
           cs.compare = cs.compare.slice(0, 500);
