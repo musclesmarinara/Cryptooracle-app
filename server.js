@@ -228,17 +228,33 @@ async function fetchKalshi() {
         .sort((a, b) => a.closeMs - b.closeMs);
       if (!upcoming.length) { out[coin] = { error: 'no upcoming' }; continue; }
       const pick = upcoming[0].m;
-      // Kalshi prices are in cents (0-100). yes_bid/yes_ask/last_price represent
-      // the implied probability of YES (which for these markets = "up").
-      const yesPrice = (pick.last_price ?? pick.yes_bid ?? pick.yes_ask);
-      const probUp = (typeof yesPrice === 'number') ? yesPrice / 100 : null;
+      // Kalshi is migrating from integer-cents fields (yes_bid=64) to _dollars
+      // fields (yes_bid_dollars=0.64). Support BOTH, and fall back through
+      // last price -> mid of bid/ask -> bid -> ask. Fresh 15-min markets often
+      // have no last trade yet, so the bid/ask midpoint is the best estimate.
+      const num = v => (typeof v === 'number' && isFinite(v)) ? v : null;
+      // Normalize any field to a 0..1 probability.
+      const asProb = (dollars, cents) => {
+        const d = num(dollars); if (d != null) return d > 1 ? d / 100 : d; // _dollars is 0..1 (sometimes given as 0..100)
+        const c = num(cents);   if (c != null) return c / 100;
+        return null;
+      };
+      const lastP = asProb(pick.last_price_dollars, pick.last_price);
+      const yesBid = asProb(pick.yes_bid_dollars, pick.yes_bid);
+      const yesAsk = asProb(pick.yes_ask_dollars, pick.yes_ask);
+      let probUp = null;
+      if (lastP != null && lastP > 0 && lastP < 1) probUp = lastP;
+      else if (yesBid != null && yesAsk != null) probUp = (yesBid + yesAsk) / 2;
+      else if (yesBid != null) probUp = yesBid;
+      else if (yesAsk != null) probUp = yesAsk;
+      else if (lastP != null) probUp = lastP; // 0 or 1 edge cases
       out[coin] = {
         ticker: pick.ticker,
         title: pick.title || pick.subtitle || '',
         closeMs: upcoming[0].closeMs,
         probUp,                                   // 0..1, market's chance of "up"
         marketDir: probUp == null ? null : (probUp >= 0.5 ? 'UP' : 'DOWN'),
-        volume: pick.volume ?? null
+        volume: pick.volume ?? pick.volume_fp ?? null
       };
     } catch (e) {
       out[coin] = { error: e.message };
