@@ -709,6 +709,18 @@ async function cycle() {
       // Start neutral at 1.0 each.
       if (!cs.srcWeights) cs.srcWeights = { market:1, ensemble:1, ai:1 };
 
+      // ----- ELITE METRICS -----
+      // Calibration: for the Overall Pick, bucket predictions by stated confidence
+      // and track how often each bucket actually hits. A well-calibrated forecaster's
+      // 70% bucket wins ~70% of the time — THE mark of an elite predictor.
+      // Bins: 50-60, 60-70, 70-80, 80-90, 90-100 (%).
+      if (!cs.calibration) cs.calibration = [0,1,2,3,4].map(() => ({ sum:0, hit:0, n:0 }));
+      // Brier score accumulator for the Overall Pick (lower = sharper probabilities).
+      if (!cs.brier) cs.brier = { sum:0, n:0 };
+      // High-conviction sub-scoreboard: only count Overall picks above a confidence
+      // threshold. Pros don't bet every hand — this measures the ones it's sure of.
+      if (!cs.convict) cs.convict = { c:0, n:0, threshold:0.65 };
+
       // (a) Score any locked comparisons whose target has passed.
       if (verified !== null) {
         const keep = [];
@@ -754,6 +766,31 @@ async function cycle() {
               const next = right ? w * (1 + LR) : w * (1 - LR);
               cs.srcWeights[k] = Math.max(MINW, Math.min(MAXW, next));
             });
+          }
+
+          // ----- Record ELITE METRICS for the Overall Pick -----
+          if (actualDir !== 'FLAT' && c.overallDir && typeof c.overallConf === 'number') {
+            const hit = c.overallDir === actualDir ? 1 : 0;
+            const conf = Math.max(0.5, Math.min(1, c.overallConf)); // stated P(correct)
+
+            // Calibration bin (by confidence): 50-60→0, 60-70→1, 70-80→2, 80-90→3, 90-100→4
+            let bin = Math.floor((conf - 0.5) / 0.1);
+            bin = Math.max(0, Math.min(4, bin));
+            cs.calibration[bin].sum += conf;
+            cs.calibration[bin].hit += hit;
+            cs.calibration[bin].n += 1;
+
+            // Brier score: (forecast_prob_of_actual − outcome)². For a directional
+            // call with confidence `conf`, the forecast prob that it's correct is conf;
+            // outcome is 1 if right, 0 if wrong. Lower is sharper. 0.25 = no skill.
+            cs.brier.sum += Math.pow(conf - hit, 2);
+            cs.brier.n += 1;
+
+            // High-conviction sub-scoreboard: only the picks it was most sure about.
+            if (conf >= (cs.convict.threshold || 0.65)) {
+              cs.convict.n += 1;
+              if (hit) cs.convict.c += 1;
+            }
           }
           keep.unshift(c); // keep scored ones at the front (recent history)
         });
@@ -808,19 +845,36 @@ async function cycle() {
           if (ensembleDir && ensembleDir !== 'FLAT') { vote += sw.ensemble * ensConf * signOf(ensembleDir); totalW += sw.ensemble * ensConf; }
           if (aiDir && aiDir !== 'FLAT') { vote += sw.ai * aiConf * signOf(aiDir); totalW += sw.ai * aiConf; }
 
-          let overallDir = null, overallConf = null;
+          let overallDir = null, overallConf = null, overallConfRaw = null;
           if (totalW > 0 && Math.abs(vote) > 1e-9) {
             overallDir = vote > 0 ? 'UP' : 'DOWN';
-            // Confidence: net conviction as a fraction of total weight, mapped to ~0.5..1.
-            overallConf = 0.5 + 0.5 * Math.min(1, Math.abs(vote) / totalW);
+            // Raw conviction: net vote as a fraction of total weight, mapped to ~0.5..1.
+            overallConfRaw = 0.5 + 0.5 * Math.min(1, Math.abs(vote) / totalW);
           } else if (marketDir || ensembleDir || aiDir) {
-            // All confidences ~0 (everyone near coin-flip): fall back to a simple
-            // weighted majority of whatever directional calls exist.
             let m = 0;
             if (marketDir) m += sw.market * signOf(marketDir);
             if (ensembleDir) m += sw.ensemble * signOf(ensembleDir);
             if (aiDir) m += sw.ai * signOf(aiDir);
-            if (m !== 0) { overallDir = m > 0 ? 'UP' : 'DOWN'; overallConf = 0.5; }
+            if (m !== 0) { overallDir = m > 0 ? 'UP' : 'DOWN'; overallConfRaw = 0.5; }
+          }
+
+          // ----- CALIBRATION: make stated confidence TRUE -----
+          // Look up the historical hit-rate of the confidence bin this prediction
+          // falls into. If the model has said "70%" enough times, we trust the
+          // empirical hit-rate over the raw number, blending more toward reality as
+          // evidence accumulates. This is what makes "70%" actually mean 70%.
+          if (overallConfRaw != null) {
+            let bin = Math.floor((overallConfRaw - 0.5) / 0.1);
+            bin = Math.max(0, Math.min(4, bin));
+            const cal = cs.calibration && cs.calibration[bin];
+            if (cal && cal.n >= 10) {
+              const empirical = cal.hit / cal.n;            // what actually happened in this bin
+              const trust = Math.min(1, cal.n / 50);        // more samples → trust empirical more
+              overallConf = overallConfRaw * (1 - trust) + empirical * trust;
+              overallConf = Math.max(0.5, Math.min(0.99, overallConf));
+            } else {
+              overallConf = overallConfRaw;                 // not enough history yet
+            }
           }
 
           cs.compare.unshift({
@@ -830,7 +884,7 @@ async function cycle() {
             marketDir, marketProbUp: (km && typeof km.probUp === 'number') ? km.probUp : null,
             ensembleDir, ensemblePredicted: pred.predicted,
             aiDir, aiProbUp: ml ? ml.pUp : null, aiPredicted: ml ? ml.predictedPrice : null,
-            overallDir, overallConf,              // the meta-predictor's call + its confidence
+            overallDir, overallConf, overallConfRaw,   // calibrated + raw confidence
             srcWeightsAtLock: { ...sw },          // snapshot of trust weights when locked
             scored: false, lockedAt: nowMs
           });
@@ -944,6 +998,21 @@ function coinSnapshot(id) {
       recent: Array.isArray(cs.compare) ? cs.compare.filter(c => c.scored).slice(0, 30) : [],
       score: cs.compareScore || { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0}, overall:{c:0,n:0} },
       srcWeights: cs.srcWeights || { market:1, ensemble:1, ai:1 },
+      // Elite forecasting metrics for the Overall Pick:
+      elite: {
+        // Brier score: 0 = perfect, 0.25 = no skill (coin flip), lower is better.
+        brier: (cs.brier && cs.brier.n > 0) ? cs.brier.sum / cs.brier.n : null,
+        brierN: cs.brier ? cs.brier.n : 0,
+        // High-conviction record: accuracy on only the picks it was most sure of.
+        conviction: cs.convict ? { c: cs.convict.c, n: cs.convict.n, threshold: cs.convict.threshold } : null,
+        // Calibration curve: per confidence bin, stated vs actual hit-rate.
+        calibration: (cs.calibration || []).map((b, i) => ({
+          band: `${50 + i*10}-${60 + i*10}%`,
+          stated: b.n > 0 ? b.sum / b.n : null,
+          actual: b.n > 0 ? b.hit / b.n : null,
+          n: b.n
+        }))
+      },
       kalshi: (() => {
         const k = (state.kalshi && state.kalshi[id]) ? { ...state.kalshi[id] } : {};
         const lp = state.lastPrices && state.lastPrices[id] ? state.lastPrices[id].verified : null;
