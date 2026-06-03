@@ -701,7 +701,13 @@ async function cycle() {
       // Lock in all three direction calls for the next boundary (only once each),
       // then score them together when that boundary's actual price is known.
       if (!Array.isArray(cs.compare)) cs.compare = [];
-      if (!cs.compareScore) cs.compareScore = { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0} };
+      if (!cs.compareScore) cs.compareScore = { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0}, overall:{c:0,n:0} };
+      // Backfill 'overall' for states created before this feature existed.
+      if (!cs.compareScore.overall) cs.compareScore.overall = { c:0, n:0 };
+      // Per-source reliability weights (per coin). These rise when a source is
+      // right and fall when it's wrong, so the Overall Pick learns whom to trust.
+      // Start neutral at 1.0 each.
+      if (!cs.srcWeights) cs.srcWeights = { market:1, ensemble:1, ai:1 };
 
       // (a) Score any locked comparisons whose target has passed.
       if (verified !== null) {
@@ -727,12 +733,28 @@ async function cycle() {
           c.actualPrice = settle;        // the averaged settlement value we graded on
           c.gradedVs = (typeof c.strike === 'number') ? 'strike' : 'priceAtLock';
           c.scored = true;
-          // Tally correctness for each predictor that made a call.
-          [['market', c.marketDir], ['ensemble', c.ensembleDir], ['ai', c.aiDir]].forEach(([k, dir]) => {
+          // Tally correctness for each predictor that made a call (now incl. overall).
+          [['market', c.marketDir], ['ensemble', c.ensembleDir], ['ai', c.aiDir], ['overall', c.overallDir]].forEach(([k, dir]) => {
             if (!dir || actualDir === 'FLAT') return;
             cs.compareScore[k].n += 1;
             if (dir === actualDir) cs.compareScore[k].c += 1;
           });
+
+          // ----- Update per-source reliability weights (the learning step) -----
+          // Each of the 3 base sources nudges its weight up when right, down when
+          // wrong, via a slow exponential update. This is how the Overall Pick
+          // "keeps improving itself" — it gradually trusts the better sources more.
+          if (actualDir !== 'FLAT') {
+            const LR = 0.04, MINW = 0.2, MAXW = 3.0;
+            [['market', c.marketDir], ['ensemble', c.ensembleDir], ['ai', c.aiDir]].forEach(([k, dir]) => {
+              if (!dir) return;
+              const right = dir === actualDir;
+              const w = cs.srcWeights[k] ?? 1;
+              // Multiplicative-weights style: reward correct, penalize wrong.
+              const next = right ? w * (1 + LR) : w * (1 - LR);
+              cs.srcWeights[k] = Math.max(MINW, Math.min(MAXW, next));
+            });
+          }
           keep.unshift(c); // keep scored ones at the front (recent history)
         });
         // Keep a bounded history of scored comparisons + all still-pending ones.
@@ -764,6 +786,43 @@ async function cycle() {
           // Market: Kalshi's own implied call (YES if probUp >= 0.5).
           const marketDir = (km && km.marketDir) ? km.marketDir : null;
 
+          // ----- OVERALL PICK: combine the 3 via (reliability weight × confidence) -----
+          // Confidence = how far each source leans from a 50/50 coin flip (0..1).
+          //   market:   |probUp - 0.5| * 2
+          //   ai:       |pUp - 0.5| * 2
+          //   ensemble: scaled distance of predicted price from the reference level
+          // Each source casts a signed vote (+ for UP, − for DOWN) sized by
+          // weight × confidence. We sum the votes; the sign is the Overall direction
+          // and the magnitude (squashed to 0..1) is its confidence.
+          const sw = cs.srcWeights || { market:1, ensemble:1, ai:1 };
+          const signOf = d => d === 'UP' ? 1 : d === 'DOWN' ? -1 : 0;
+          const marketConf = (km && typeof km.probUp === 'number') ? Math.min(1, Math.abs(km.probUp - 0.5) * 2) : 0;
+          const aiConf = (ml && typeof ml.pUp === 'number') ? Math.min(1, Math.abs(ml.pUp - 0.5) * 2) : 0;
+          // Ensemble confidence: how far its predicted % move is from the reference,
+          // capped so a wild prediction can't dominate. ~0.5% move => full confidence.
+          const ensMovePct = ref > 0 ? Math.abs(pred.predicted - ref) / ref : 0;
+          const ensConf = Math.min(1, ensMovePct / 0.005);
+
+          let vote = 0, totalW = 0;
+          if (marketDir) { vote += sw.market * marketConf * signOf(marketDir); totalW += sw.market * marketConf; }
+          if (ensembleDir && ensembleDir !== 'FLAT') { vote += sw.ensemble * ensConf * signOf(ensembleDir); totalW += sw.ensemble * ensConf; }
+          if (aiDir && aiDir !== 'FLAT') { vote += sw.ai * aiConf * signOf(aiDir); totalW += sw.ai * aiConf; }
+
+          let overallDir = null, overallConf = null;
+          if (totalW > 0 && Math.abs(vote) > 1e-9) {
+            overallDir = vote > 0 ? 'UP' : 'DOWN';
+            // Confidence: net conviction as a fraction of total weight, mapped to ~0.5..1.
+            overallConf = 0.5 + 0.5 * Math.min(1, Math.abs(vote) / totalW);
+          } else if (marketDir || ensembleDir || aiDir) {
+            // All confidences ~0 (everyone near coin-flip): fall back to a simple
+            // weighted majority of whatever directional calls exist.
+            let m = 0;
+            if (marketDir) m += sw.market * signOf(marketDir);
+            if (ensembleDir) m += sw.ensemble * signOf(ensembleDir);
+            if (aiDir) m += sw.ai * signOf(aiDir);
+            if (m !== 0) { overallDir = m > 0 ? 'UP' : 'DOWN'; overallConf = 0.5; }
+          }
+
           cs.compare.unshift({
             targetMs,
             priceAtLock: verified,
@@ -771,6 +830,8 @@ async function cycle() {
             marketDir, marketProbUp: (km && typeof km.probUp === 'number') ? km.probUp : null,
             ensembleDir, ensemblePredicted: pred.predicted,
             aiDir, aiProbUp: ml ? ml.pUp : null, aiPredicted: ml ? ml.predictedPrice : null,
+            overallDir, overallConf,              // the meta-predictor's call + its confidence
+            srcWeightsAtLock: { ...sw },          // snapshot of trust weights when locked
             scored: false, lockedAt: nowMs
           });
           cs.compare = cs.compare.slice(0, 500);
@@ -881,7 +942,8 @@ function coinSnapshot(id) {
     compare: {
       latest: (Array.isArray(cs.compare) && cs.compare.length) ? cs.compare[0] : null,
       recent: Array.isArray(cs.compare) ? cs.compare.filter(c => c.scored).slice(0, 30) : [],
-      score: cs.compareScore || { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0} },
+      score: cs.compareScore || { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0}, overall:{c:0,n:0} },
+      srcWeights: cs.srcWeights || { market:1, ensemble:1, ai:1 },
       kalshi: (() => {
         const k = (state.kalshi && state.kalshi[id]) ? { ...state.kalshi[id] } : {};
         const lp = state.lastPrices && state.lastPrices[id] ? state.lastPrices[id].verified : null;
