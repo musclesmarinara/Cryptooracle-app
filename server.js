@@ -228,7 +228,9 @@ async function fetchKalshi() {
         .sort((a, b) => a.closeMs - b.closeMs);
       if (!upcoming.length) { out[coin] = { error: 'no upcoming' }; continue; }
       const pick = upcoming[0].m;
-      const num = v => (typeof v === 'number' && isFinite(v)) ? v : null;
+      // Kalshi's fixed-point migration returns price fields as STRINGS in dollars
+      // (e.g. "0.5700"), not numbers. parseFloat handles strings AND numbers.
+      const num = v => { if (v == null) return null; const n = parseFloat(v); return isFinite(n) ? n : null; };
       const asProb = (dollars, cents) => {
         const d = num(dollars); if (d != null) return d > 1 ? d / 100 : d;
         const c = num(cents);   if (c != null) return c / 100;
@@ -267,11 +269,11 @@ async function fetchKalshi() {
 
       out[coin] = {
         ticker: pick.ticker,
-        title: pick.title || pick.subtitle || '',
+        title: pick.title || pick.yes_sub_title || pick.subtitle || '',
         closeMs: upcoming[0].closeMs,
         probUp,                                   // 0..1, market's chance of "up"
         marketDir: probUp == null ? null : (probUp >= 0.5 ? 'UP' : 'DOWN'),
-        volume: pick.volume ?? pick.volume_fp ?? null
+        volume: num(pick.volume_fp) ?? num(pick.volume) ?? null
       };
     } catch (e) {
       out[coin] = { error: e.message };
