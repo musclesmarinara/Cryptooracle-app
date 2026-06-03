@@ -293,41 +293,130 @@ async function fetchKalshi() {
   return out;
 }
 
-// ---------- One-time historical seeding (Kraken 15-min candles) ----------
-// Kraken's public OHLC endpoint returns up to ~720 candles per request with
-// no API key. At interval=15 (minutes) that's ~7.5 days of history per coin —
-// a solid head start for the trainable model. Fills priceHistory for any coin
-// that doesn't already have a substantial history, so it's safe to call once.
+// ---------- Deep historical seeding (multi-source, OHLC) ----------
+// Pulls as much valid 15-min history as we can legitimately reach and merges it
+// into one clean, de-duplicated, chronological candle series PER COIN. Sources:
+//   • Coinbase Exchange candles — paginated BACKWARD (300/req) for deep history.
+//   • Kraken OHLC — its most recent 720 candles (no deeper; hard API limit).
+// We store full candles {t, o, h, l, c, v} so candle-pattern features can use the
+// whole bar, not just the close. Binance is intentionally skipped: it geo-blocks
+// cloud IPs (Render), so it's unreachable from the deployed backend.
+const HISTORY_CAP = 6000;          // ~62 days of 15-min candles retained per coin
+const SEED_15M_SEC = 900;          // 15-minute granularity in seconds
+
+// Fetch up to `pages` pages of Coinbase 15-min candles, walking backward in time.
+async function fetchCoinbaseCandles(coin, pages = 20) {
+  const product = SOURCE_SYMBOLS[coin].coinbase;       // e.g. BTC-USD
+  const out = [];
+  let end = Math.floor(Date.now() / 1000);
+  for (let p = 0; p < pages; p++) {
+    const start = end - SEED_15M_SEC * 300;            // 300 candles per request (API max)
+    const url = `https://api.exchange.coinbase.com/products/${product}/candles?granularity=${SEED_15M_SEC}&start=${start}&end=${end}`;
+    let d;
+    try {
+      const r = await timedFetch(url, 12000);
+      if (!r.ok) break;                                // stop on first failure (rate limit / no more data)
+      d = await r.json();
+    } catch { break; }
+    if (!Array.isArray(d) || !d.length) break;
+    // Coinbase candle: [time(sec), low, high, open, close, volume]
+    for (const c of d) {
+      const t = Number(c[0]) * 1000;
+      const o = parseFloat(c[3]), h = parseFloat(c[2]), l = parseFloat(c[1]), close = parseFloat(c[4]), v = parseFloat(c[5]);
+      if (isFinite(close) && close > 0) out.push({ t, o, h, l, c: close, v: isFinite(v) ? v : 0 });
+    }
+    // Walk further back: next page ends where this one started.
+    end = start;
+    await new Promise(res => setTimeout(res, 250));     // be polite to the API
+  }
+  return out;
+}
+
+// Kraken's most recent 720 15-min candles (full OHLC).
+async function fetchKrakenCandles(coin) {
+  const pair = SOURCE_SYMBOLS[coin].kraken;
+  try {
+    const r = await timedFetch(`https://api.kraken.com/0/public/OHLC?pair=${pair}&interval=15`, 12000);
+    if (!r.ok) return [];
+    const d = await r.json();
+    if (!d.result) return [];
+    const key = Object.keys(d.result).find(k => k !== 'last');
+    const candles = key ? d.result[key] : null;
+    if (!Array.isArray(candles)) return [];
+    // Kraken candle: [time(sec), open, high, low, close, vwap, volume, count]
+    return candles.map(c => ({
+      t: Number(c[0]) * 1000,
+      o: parseFloat(c[1]), h: parseFloat(c[2]), l: parseFloat(c[3]), c: parseFloat(c[4]),
+      v: parseFloat(c[6])
+    })).filter(p => isFinite(p.c) && p.c > 0);
+  } catch { return []; }
+}
+
+// Pull longer-timeframe candles (hourly / daily) for multi-timeframe CONTEXT.
+// Each Kraken request gives 720 of the interval: 60 → 30 days hourly, 1440 → ~2y daily.
+async function fetchKrakenInterval(coin, intervalMin) {
+  const pair = SOURCE_SYMBOLS[coin].kraken;
+  try {
+    const r = await timedFetch(`https://api.kraken.com/0/public/OHLC?pair=${pair}&interval=${intervalMin}`, 12000);
+    if (!r.ok) return [];
+    const d = await r.json();
+    if (!d.result) return [];
+    const key = Object.keys(d.result).find(k => k !== 'last');
+    const candles = key ? d.result[key] : null;
+    if (!Array.isArray(candles)) return [];
+    return candles.map(c => ({ t: Number(c[0]) * 1000, c: parseFloat(c[4]) }))
+                  .filter(p => isFinite(p.c) && p.c > 0)
+                  .sort((a, b) => a.t - b.t);
+  } catch { return []; }
+}
+
+// Merge candle arrays by timestamp (later sources don't overwrite earlier ones),
+// de-dupe, sort chronologically, and cap.
+function mergeCandles(...arrays) {
+  const byTime = new Map();
+  for (const arr of arrays) {
+    for (const p of arr) {
+      if (!byTime.has(p.t)) byTime.set(p.t, p);
+    }
+  }
+  return [...byTime.values()].sort((a, b) => a.t - b.t).slice(-HISTORY_CAP);
+}
+
 async function seedHistory() {
   const results = {};
-  // Make sure the state structure exists before we touch it (in case the DB
-  // loaded an older/empty shape).
   if (!state.coins) state.coins = {};
+  if (!state.context) state.context = {};   // multi-timeframe context per coin
   for (const coin of COINS) {
     try {
       if (!state.coins[coin]) state.coins[coin] = defaultCoinState();
       const cs = state.coins[coin];
       if (!Array.isArray(cs.priceHistory)) cs.priceHistory = [];
-      if (cs.priceHistory.length >= 600) { results[coin] = 'skipped (already seeded)'; continue; }
-      const pair = SOURCE_SYMBOLS[coin].kraken;
-      const r = await timedFetch(`https://api.kraken.com/0/public/OHLC?pair=${pair}&interval=15`, 12000);
-      if (!r.ok) { results[coin] = 'fetch failed ' + r.status; continue; }
-      const d = await r.json();
-      if (!d.result) { results[coin] = 'no result'; continue; }
-      // The result object has the candle array under a pair-named key (not "last")
-      const key = Object.keys(d.result).find(k => k !== 'last');
-      const candles = key ? d.result[key] : null;
-      if (!Array.isArray(candles) || !candles.length) { results[coin] = 'no candles'; continue; }
-      // Kraken candle: [time(sec), open, high, low, close, vwap, volume, count]
-      const hist = candles.map(c => ({ t: Number(c[0]) * 1000, c: parseFloat(c[4]) }))
-                          .filter(p => isFinite(p.c) && p.c > 0)
-                          .sort((a, b) => a.t - b.t);
-      // Merge in front of any live data we've already collected, keep chronological
-      const merged = [...hist, ...cs.priceHistory].sort((a, b) => a.t - b.t);
-      // De-dupe by timestamp and cap
-      const seen = new Set();
-      cs.priceHistory = merged.filter(p => { if (seen.has(p.t)) return false; seen.add(p.t); return true; }).slice(-1500);
-      results[coin] = `seeded ${hist.length} candles (history now ${cs.priceHistory.length})`;
+
+      // Pull from every reachable source, in parallel where possible.
+      const [cb, kr] = await Promise.all([
+        fetchCoinbaseCandles(coin, 24),   // ~24*300 = up to ~7200 candles (~75 days) if available
+        fetchKrakenCandles(coin)          // most recent ~720
+      ]);
+
+      // Existing live history (kept), plus both deep sources. Normalize any old
+      // close-only points so the merge doesn't lose them.
+      const existing = cs.priceHistory.map(p => ({
+        t: p.t, o: p.o ?? p.c, h: p.h ?? p.c, l: p.l ?? p.c, c: p.c, v: p.v ?? 0
+      }));
+      cs.priceHistory = mergeCandles(existing, cb, kr);
+
+      // Multi-timeframe CONTEXT: hourly (30 days) + daily (~2 years) closes.
+      const [hourly, daily] = await Promise.all([
+        fetchKrakenInterval(coin, 60),
+        fetchKrakenInterval(coin, 1440)
+      ]);
+      state.context[coin] = {
+        hourly: hourly.slice(-720),
+        daily: daily.slice(-720),
+        updatedAt: Date.now()
+      };
+
+      results[coin] = `coinbase ${cb.length} + kraken ${kr.length} → ${cs.priceHistory.length} candles · context ${hourly.length}h/${daily.length}d`;
     } catch (e) {
       results[coin] = 'error: ' + e.message;
     }
@@ -398,14 +487,17 @@ function nextBoundary() { const ms = 15 * 60 * 1000; return Math.ceil(Date.now()
 //  test set is the most recent chunk the model never trained on.
 // ============================================================
 
-// Build a feature vector at index i using only closes[0..i].
-// NOTE on honesty: every feature uses ONLY data up to and including index i.
-// The label (built later) is the move from i to i+1. No future info leaks in.
-function featuresAt(closes, i) {
+// Build a feature vector at index i using ONLY candles[0..i] (no look-ahead).
+// `candles` are {t,o,h,l,c,v}. `ctx` is optional multi-timeframe context
+// (hourly/daily closes) whose values at time candles[i].t are used for longer-
+// horizon trend features. The label (built later) is the move from i to i+1.
+function featuresAt(candles, i, ctx) {
   if (i < 35) return null; // need enough history behind this point
-  const window = closes.slice(0, i + 1);
-  const cur = window[window.length - 1];
-  const at = k => window[window.length - 1 - k]; // k bars ago
+  const window = candles.slice(0, i + 1);
+  const closesW = window.map(p => p.c);
+  const cur = closesW[closesW.length - 1];
+  const curCandle = window[window.length - 1];
+  const at = k => closesW[closesW.length - 1 - k]; // close k bars ago
 
   // --- Momentum over several horizons (returns %) ---
   const ret1 = (cur - at(1)) / at(1);
@@ -418,29 +510,73 @@ function featuresAt(closes, i) {
   const accel = ret1 - ((at(1) - at(2)) / at(2));
 
   // --- Oscillators ---
-  const r14 = rsi(window, 14);
-  const r7 = rsi(window, 7);
+  const r14 = rsi(closesW, 14);
+  const r7 = rsi(closesW, 7);
 
   // --- MACD (normalized) + its components ---
-  const e12 = ema(window, 12), e26 = ema(window, 26);
+  const e12 = ema(closesW, 12), e26 = ema(closesW, 26);
   const macd = (e12 - e26) / cur;
-  const e9base = ema(window, 9);
+  const e9base = ema(closesW, 9);
   const emaSpread = (e9base - e26) / cur; // short vs long trend
 
   // --- Price relative to moving averages ---
-  const s20 = sma(window, 20) || cur;
-  const s10 = sma(window, 10) || cur;
+  const s20 = sma(closesW, 20) || cur;
+  const s10 = sma(closesW, 10) || cur;
   const smaRel20 = (cur - s20) / s20;
   const smaRel10 = (cur - s10) / s10;
 
-  // --- Bollinger position: where in the band is price (−1..+1-ish) ---
-  const sd20 = stddev(window.slice(-20)) || (cur * 1e-6);
+  // --- Bollinger position ---
+  const sd20 = stddev(closesW.slice(-20)) || (cur * 1e-6);
   const bollPos = (cur - s20) / (2 * sd20);
 
-  // --- Volatility level + volatility ratio (regime change signal) ---
-  const vol20 = stddev(window.slice(-20)) / cur;
-  const vol5 = stddev(window.slice(-5)) / cur;
-  const volRatio = vol20 > 0 ? (vol5 / vol20) : 1; // >1 = vol rising
+  // --- Volatility level + ratio (regime change signal) ---
+  const vol20 = stddev(closesW.slice(-20)) / cur;
+  const vol5 = stddev(closesW.slice(-5)) / cur;
+  const volRatio = vol20 > 0 ? (vol5 / vol20) : 1;
+
+  // ===== CANDLE-PATTERN features (use full OHLC of recent bars) =====
+  // Reading the actual candle shapes, as a trader would.
+  const o = curCandle.o ?? cur, h = curCandle.h ?? cur, l = curCandle.l ?? cur;
+  const range = (h - l) || (cur * 1e-6);
+  const body = (cur - o);                       // + = bullish bar, − = bearish
+  const bodyFrac = body / range;                // body size vs full range (−1..1)
+  const upperWick = (h - Math.max(o, cur)) / range;   // rejection from above (0..1)
+  const lowerWick = (Math.min(o, cur) - l) / range;   // rejection from below (0..1)
+  const closePos = (cur - l) / range;           // where close sits in the bar (0..1)
+  // Recent bar agreement: how many of the last 3 bars closed up (trendiness).
+  let upBars = 0;
+  for (let k = 0; k < 3 && (window.length - 1 - k) >= 1; k++) {
+    const b = window[window.length - 1 - k];
+    if (b.c > (b.o ?? b.c)) upBars++;
+  }
+  const barAgree = (upBars - 1.5) / 1.5;        // ~−1..1
+
+  // ===== MULTI-TIMEFRAME CONTEXT (longer-horizon trend) =====
+  // Where price sits relative to hourly & daily trend, as of this bar's time.
+  // Uses only context points at or before the current bar (no look-ahead).
+  let hourTrend = 0, dayTrend = 0;
+  if (ctx) {
+    const tNow = curCandle.t;
+    const upTo = (arr) => {
+      if (!Array.isArray(arr) || !arr.length) return null;
+      let last = null;
+      for (const p of arr) { if (p.t <= tNow) last = p; else break; }
+      return last;
+    };
+    if (Array.isArray(ctx.hourly) && ctx.hourly.length) {
+      const hNow = upTo(ctx.hourly);
+      // find an hourly point ~6 hours earlier
+      const idx = ctx.hourly.findIndex(p => p === hNow);
+      const hPrev = idx >= 6 ? ctx.hourly[idx - 6] : ctx.hourly[0];
+      if (hNow && hPrev && hPrev.c > 0) hourTrend = (hNow.c - hPrev.c) / hPrev.c;
+    }
+    if (Array.isArray(ctx.daily) && ctx.daily.length) {
+      const dNow = upTo(ctx.daily);
+      const idx = ctx.daily.findIndex(p => p === dNow);
+      const dPrev = idx >= 3 ? ctx.daily[idx - 3] : ctx.daily[0];
+      if (dNow && dPrev && dPrev.c > 0) dayTrend = (dNow.c - dPrev.c) / dPrev.c;
+    }
+  }
 
   return [
     ret1 * 100,
@@ -457,11 +593,20 @@ function featuresAt(closes, i) {
     smaRel10 * 100,
     bollPos,
     vol20 * 100,
-    volRatio
+    volRatio,
+    // candle-pattern features:
+    bodyFrac,
+    upperWick,
+    lowerWick,
+    closePos,
+    barAgree,
+    // multi-timeframe context:
+    hourTrend * 100,
+    dayTrend * 100
   ];
 }
 
-const N_FEATURES = 15;
+const N_FEATURES = 22;
 const sigmoid = z => 1 / (1 + Math.exp(-z));
 
 // Standardize features (z-score) using training-set mean/std only.
@@ -530,12 +675,14 @@ function predictLinear(model, x) {
 function trainModelForCoin(coin) {
   const cs = state.coins[coin];
   if (!cs) return null;
-  const closes = (Array.isArray(cs.priceHistory) ? cs.priceHistory : []).map(p => p.c);
+  const candles = (Array.isArray(cs.priceHistory) ? cs.priceHistory : []);
+  const closes = candles.map(p => p.c);
   if (closes.length < 90) return null;
+  const ctx = (state.context && state.context[coin]) ? state.context[coin] : null;
 
   const rawX = [], dirY = [], retY = [];
-  for (let i = 35; i < closes.length - 1; i++) {
-    const f = featuresAt(closes, i);
+  for (let i = 35; i < candles.length - 1; i++) {
+    const f = featuresAt(candles, i, ctx);
     if (!f) continue;
     const nextRet = (closes[i + 1] - closes[i]) / closes[i];
     rawX.push(f);
@@ -601,9 +748,11 @@ function mlPredict(coin) {
   if (!cs) return null;
   const m = cs.mlModel;
   if (!m) return null;
-  const closes = (Array.isArray(cs.priceHistory) ? cs.priceHistory : []).map(p => p.c);
-  if (closes.length < 31) return null;
-  const f = featuresAt(closes, closes.length - 1);
+  const candles = (Array.isArray(cs.priceHistory) ? cs.priceHistory : []);
+  const closes = candles.map(p => p.c);
+  if (closes.length < 36) return null;
+  const ctx = (state.context && state.context[coin]) ? state.context[coin] : null;
+  const f = featuresAt(candles, candles.length - 1, ctx);
   if (!f) return null;
   const x = applyScaler(f, m.scaler);
   const pUp = predictLogistic(m.logModel, x);
@@ -662,8 +811,10 @@ async function cycle() {
       if (prices.length) {
         verified = median(prices);
         state.lastPrices[coin] = { verified, sources: perCoin[coin], ts: nowMs };
-        cs.priceHistory.push({ t: nowMs, c: verified });
-        if (cs.priceHistory.length > 1500) cs.priceHistory.shift();
+        // Live points are single-price; store as a degenerate candle so the whole
+        // series has a consistent {t,o,h,l,c,v} shape for candle-pattern features.
+        cs.priceHistory.push({ t: nowMs, o: verified, h: verified, l: verified, c: verified, v: 0 });
+        if (cs.priceHistory.length > HISTORY_CAP) cs.priceHistory.shift();
       } else if (state.lastPrices[coin]?.verified) {
         verified = state.lastPrices[coin].verified; // fallback for scoring only
       }
@@ -705,9 +856,10 @@ async function cycle() {
       // Lock in all three direction calls for the next boundary (only once each),
       // then score them together when that boundary's actual price is known.
       if (!Array.isArray(cs.compare)) cs.compare = [];
-      if (!cs.compareScore) cs.compareScore = { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0}, overall:{c:0,n:0} };
+      if (!cs.compareScore) cs.compareScore = { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0}, overall:{c:0,n:0}, leak:{c:0,n:0} };
       // Backfill 'overall' for states created before this feature existed.
       if (!cs.compareScore.overall) cs.compareScore.overall = { c:0, n:0 };
+      if (!cs.compareScore.leak) cs.compareScore.leak = { c:0, n:0 };
       // Per-source reliability weights (per coin). These rise when a source is
       // right and fall when it's wrong, so the Overall Pick learns whom to trust.
       // Start neutral at 1.0 each.
@@ -757,8 +909,12 @@ async function cycle() {
           c.actualPrice = settle;        // the averaged settlement value we graded on
           c.gradedVs = (typeof c.strike === 'number') ? 'strike' : 'priceAtLock';
           c.scored = true;
-          // Tally correctness for each predictor that made a call (now incl. overall).
-          [['market', c.marketDir], ['ensemble', c.ensembleDir], ['ai', c.aiDir], ['overall', c.overallDir]].forEach(([k, dir]) => {
+          // LEAKAGE MODEL: it committed its final call at the 5-minutes-left mark
+          // (c.leakDir, set in the cycle). We grade THAT committed call — not the
+          // outcome — so it's an honest, scoreable 5-minute-horizon forecast. If it
+          // never locked (backend missed that window), it simply isn't scored.
+          // Tally correctness for each predictor that made a call.
+          [['market', c.marketDir], ['ensemble', c.ensembleDir], ['ai', c.aiDir], ['overall', c.overallDir], ['leak', c.leakLocked ? c.leakDir : null]].forEach(([k, dir]) => {
             if (!dir || actualDir === 'FLAT') return;
             cs.compareScore[k].n += 1;
             if (dir === actualDir) cs.compareScore[k].c += 1;
@@ -916,7 +1072,33 @@ async function cycle() {
         }
       }
 
-      // ----- Retrain the ML model periodically (at most every ~15 min/coin) -----
+      // ----- LEAKAGE MODEL: lock its FINAL call when 5 minutes remain -----
+      // The leakage model watches the live price and commits one final, frozen
+      // prediction at the 5-minutes-left mark (the 10-min point of the 15-min
+      // block). It uses the price as it stands then — a real call with a 5-minute
+      // horizon — and is scored against the actual outcome like everyone else.
+      if (verified !== null) {
+        const targetMs = nextBoundary();
+        const msLeft = targetMs - nowMs;
+        const entry = cs.compare.find(c => c.targetMs === targetMs);
+        // Within the 5-minutes-left window, and only if not already locked.
+        if (entry && !entry.leakLocked && msLeft <= 5 * 60 * 1000 && msLeft > 0) {
+          const km = kalshi[coin];
+          const strike = (km && typeof km.strike === 'number') ? km.strike : null;
+          const strikeAbove = !km || km.strikeAbove !== false;
+          const ref = strike != null ? strike : entry.priceAtLock;
+          if (ref != null) {
+            const above = verified > ref;
+            entry.leakDir = (verified === ref) ? 'FLAT' : ((above === strikeAbove) ? 'UP' : 'DOWN');
+            entry.leakLocked = true;
+            entry.leakLockedAt = nowMs;
+            entry.leakLockPrice = verified;
+            console.log(`[leak] ${coin} locked final call ${entry.leakDir} with ~5min left (price ${verified} vs ref ${ref})`);
+          }
+        }
+      }
+
+
       // Training is gradient descent over the full history, so we throttle it
       // rather than running it every single cycle.
       const RETRAIN_MS = 5 * 60 * 1000;
@@ -982,8 +1164,39 @@ function coinSnapshot(id) {
     };
   }
 
-  // Trained-model live prediction + honest out-of-sample metrics (null until trained)
-  const ml = mlPredict(id);
+  // ----- LEAKAGE MODEL: live readout (watch → lock at 5 min left) -----
+  // The leakage model watches the live price and commits ONE final call when 5
+  // minutes remain. Before that it's "watching"; after, it shows the frozen call.
+  // Not future-leakage — it only uses the price as it stands, with a 5-min horizon.
+  let leakLive = null;
+  {
+    const km = (state.kalshi && state.kalshi[id]) ? state.kalshi[id] : null;
+    const strike = (km && typeof km.strike === 'number') ? km.strike : null;
+    const strikeAbove = !km || km.strikeAbove !== false;
+    const ref = strike != null ? strike
+              : (lockedPending && typeof lockedPending.priceAtPrediction === 'number' ? lockedPending.priceAtPrediction : null);
+    const msLeft = curBoundary - Date.now();
+    const lockedEntry = Array.isArray(cs.compare) ? cs.compare.find(c => c.targetMs === curBoundary && c.leakLocked) : null;
+    if (livePrice != null && ref != null) {
+      const above = livePrice > ref;
+      const watchDir = (livePrice === ref) ? 'FLAT' : ((above === strikeAbove) ? 'UP' : 'DOWN');
+      const locked = !!lockedEntry;
+      leakLive = {
+        targetMs: curBoundary,
+        secondsLeft: Math.max(0, Math.round(msLeft / 1000)),
+        minutesLeft: Math.max(0, Math.round(msLeft / 60000)),
+        locked,                                   // has it committed its final call?
+        // Before lock: a provisional "watching" read. After lock: the frozen call.
+        dir: locked ? lockedEntry.leakDir : watchDir,
+        lockDir: locked ? lockedEntry.leakDir : null,
+        lockPrice: locked ? lockedEntry.leakLockPrice : null,
+        livePrice,
+        ref,
+        refKind: strike != null ? 'strike' : 'block-open'
+      };
+    }
+  }
+
 
   // Honest comparison: ensemble's own direction hit-rate on its scored log.
   // (HIGHER means actual came in above prediction = ensemble said "lower than reality".)
@@ -1016,11 +1229,12 @@ function coinSnapshot(id) {
     } : null,
     log: log.slice(0, 100),
     live,
+    leakLive,
     // Three-way comparison: market (Kalshi) vs ensemble vs AI
     compare: {
       latest: (Array.isArray(cs.compare) && cs.compare.length) ? cs.compare[0] : null,
       recent: Array.isArray(cs.compare) ? cs.compare.filter(c => c.scored).slice(0, 30) : [],
-      score: cs.compareScore || { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0}, overall:{c:0,n:0} },
+      score: cs.compareScore || { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0}, overall:{c:0,n:0}, leak:{c:0,n:0} },
       srcWeights: cs.srcWeights || { market:1, ensemble:1, ai:1 },
       // Elite forecasting metrics for the Overall Pick:
       elite: {
