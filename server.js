@@ -35,6 +35,9 @@ if (USE_DB) {
 }
 
 const COINS = ['bitcoin', 'ethereum', 'ripple'];
+// Price-range band widths matching Kalshi's hourly "price range" markets exactly,
+// so our band prediction lines up with a real market: BTC $100, ETH $20, XRP $0.02.
+const BAND_WIDTH = { bitcoin: 100, ethereum: 20, ripple: 0.02 };
 const SOURCE_SYMBOLS = {
   bitcoin:  { binance: 'BTCUSDT', coinbase: 'BTC-USD', kraken: 'XBTUSD' },
   ethereum: { binance: 'ETHUSDT', coinbase: 'ETH-USD', kraken: 'ETHUSD' },
@@ -479,9 +482,46 @@ function predictNext(coin) {
   const predicted = (models.sma*w.sma + models.rsi*w.rsi + models.macd*w.macd + models.lin*w.lin + models.bb*w.bb) / wSum;
   return { predicted, models, priceAtPrediction: cur };
 }
-function nextBoundary() { const ms = 15 * 60 * 1000; return Math.ceil(Date.now() / ms) * ms; }
+
+// Standard normal CDF (Abramowitz-Stegun approximation) — for band probabilities.
+function normCdf(z) {
+  const t = 1 / (1 + 0.2316419 * Math.abs(z));
+  const d = 0.3989423 * Math.exp(-z * z / 2);
+  let p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+  return z > 0 ? 1 - p : p;
+}
+
+// Predict the hourly closing price-range band (matching Kalshi's range markets).
+// Returns the predicted band plus the bands above and below, each with a % chance
+// the hour closes inside it. Probabilities come from a normal model centered on the
+// predicted close, with sigma scaled from recent volatility over the remaining time.
+function predictBands(coin, predictedClose, sigmaAbs) {
+  const width = BAND_WIDTH[coin];
+  if (!width || !isFinite(predictedClose) || predictedClose <= 0) return null;
+  const sigma = Math.max(sigmaAbs, predictedClose * 1e-5); // avoid zero
+  // The band containing the predicted close: [floor, floor+width).
+  const floor = Math.floor(predictedClose / width) * width;
+  const bandProb = (lo, hi) => Math.max(0, normCdf((hi - predictedClose) / sigma) - normCdf((lo - predictedClose) / sigma));
+  const decimals = width < 1 ? 4 : 2;
+  const mk = (lo) => {
+    const hi = lo + width;
+    return {
+      low: +lo.toFixed(decimals),
+      high: +(hi - (width < 1 ? 0.0001 : 0.01)).toFixed(decimals), // Kalshi shows e.g. "to 62,399.99"
+      prob: Math.round(bandProb(lo, hi) * 100)
+    };
+  };
+  return {
+    width,
+    below: mk(floor - width),
+    predicted: mk(floor),
+    above: mk(floor + width)
+  };
+}
+
 // The end of the current clock hour (e.g. at 8:37 → 9:00). The hourly market
 // covers [hourStart, hourEnd); halfway is hourStart + 30min.
+function nextBoundary() { const ms = 15 * 60 * 1000; return Math.ceil(Date.now() / ms) * ms; }
 function nextHourBoundary() { const ms = 60 * 60 * 1000; return Math.ceil(Date.now() / ms) * ms; }
 
 // ============================================================
@@ -1363,14 +1403,45 @@ function coinSnapshot(id) {
       const latest = (Array.isArray(cs.hourCompare) && cs.hourCompare.length) ? cs.hourCompare[0] : null;
       const hourEnd = Math.ceil(Date.now() / 3600000) * 3600000;
       const lockedThisHour = latest && latest.targetMs === hourEnd ? latest : null;
+
+      // Price-range band prediction (matches Kalshi's range markets). Predict the
+      // hour's close (ensemble + AI averaged), and size sigma from recent 15-min
+      // volatility scaled to the time remaining in the hour.
+      let bands = null;
+      try {
+        const ens = predictNext(id);
+        const ml = mlPredict(id);
+        const preds = [];
+        if (ens && isFinite(ens.predicted)) preds.push(ens.predicted);
+        if (ml && isFinite(ml.predictedPrice)) preds.push(ml.predictedPrice);
+        const live = state.lastPrices[id]?.verified ?? null;
+        const predClose = preds.length ? preds.reduce((a, b) => a + b, 0) / preds.length : live;
+        if (predClose != null) {
+          const closes = (Array.isArray(cs.priceHistory) ? cs.priceHistory : []).slice(-20).map(p => p.c);
+          // Per-15min stddev of returns → scale to remaining quarters in the hour.
+          let perStep = 0;
+          if (closes.length > 2) {
+            const rets = [];
+            for (let i = 1; i < closes.length; i++) rets.push((closes[i] - closes[i - 1]) / closes[i - 1]);
+            perStep = stddev(rets) * predClose;
+          }
+          const msLeft = Math.max(0, hourEnd - Date.now());
+          const quartersLeft = Math.max(1, msLeft / (15 * 60 * 1000));
+          const sigma = Math.max(perStep * Math.sqrt(quartersLeft), predClose * 1e-4);
+          bands = predictBands(id, predClose, sigma);
+          if (bands) bands.predictedClose = +predClose.toFixed(BAND_WIDTH[id] < 1 ? 4 : 2);
+        }
+      } catch (e) { bands = null; }
+
       return {
-        market: km,                                  // the hourly Kalshi market (strike, dir, prob)
-        latest: lockedThisHour,                      // this hour's locked call (null until :30)
+        market: km,
+        latest: lockedThisHour,
         recent: Array.isArray(cs.hourCompare) ? cs.hourCompare.filter(h => h.scored).slice(0, 24) : [],
         score: cs.hourScore || { market:{c:0,n:0}, model:{c:0,n:0} },
         hourEndMs: hourEnd,
         halfwayMs: hourEnd - 30 * 60 * 1000,
-        locksAtHalfway: true
+        locksAtHalfway: true,
+        bands                                        // predicted price-range band + neighbors
       };
     })(),
     // Three-way comparison: market (Kalshi) vs ensemble vs AI
