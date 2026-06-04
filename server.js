@@ -1206,6 +1206,10 @@ function coinSnapshot(id) {
   // so we report the ensemble's within-1% rate as its quality proxy alongside
   // the ML model's honest test accuracy. The dashboard explains both.
 
+  // Trained-model live prediction (re-evaluated for the snapshot). This is the
+  // AI model's current call + its honest out-of-sample metrics; null until trained.
+  const ml = mlPredict(id);
+
   return {
     coin: id,
     lastPrice: state.lastPrices[id] || null,
