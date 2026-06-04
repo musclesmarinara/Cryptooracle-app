@@ -1171,15 +1171,19 @@ async function cycle() {
       if (verified !== null) {
         if (!Array.isArray(cs.hourCompare)) cs.hourCompare = [];
         if (!cs.hourScore) cs.hourScore = { market:{c:0,n:0}, model:{c:0,n:0} };
+        // Dedicated hourly weights for each input. These are SEPARATE from the
+        // 15-min srcWeights and learn specifically from hourly outcomes — so the
+        // hourly model learns off BOTH: the sharpening 15-min components (via
+        // srcWeights, which it still multiplies in) AND its own hourly results.
+        if (!cs.hourWeights) cs.hourWeights = { market:1, ensemble:1, ai:1, blocks:1 };
         const hourEnd = nextHourBoundary();
         const hourStart = hourEnd - 60 * 60 * 1000;
         const halfway = hourStart + 30 * 60 * 1000;
         const km = kalshiHourly[coin] || null;
 
-        // (a) Score any resolved hours.
+        // (a) Score any resolved hours — and LEARN from each input's accuracy.
         cs.hourCompare.forEach(h => {
           if (nowMs < h.targetMs || h.scored) return;
-          // Settle = averaged price over the last ~2 min of the hour.
           const hist = Array.isArray(cs.priceHistory) ? cs.priceHistory : [];
           const wp = hist.filter(p => p.t >= h.targetMs - 120000 && p.t <= h.targetMs + 5000);
           const settle = wp.length ? wp.reduce((a, p) => a + p.c, 0) / wp.length : verified;
@@ -1193,6 +1197,25 @@ async function cycle() {
             cs.hourScore[k].n += 1;
             if (dir === h.actualDir) cs.hourScore[k].c += 1;
           });
+          // ----- Hourly learning step -----
+          // Multiplicative-weights update: each input that called the hour right
+          // gets nudged up, each that was wrong nudged down. Over many hours the
+          // model learns which inputs to trust at the hourly horizon specifically.
+          if (h.actualDir !== 'FLAT' && h.inputDirs) {
+            const LR = 0.06;
+            Object.entries(h.inputDirs).forEach(([k, dir]) => {
+              if (!dir || dir === 'FLAT' || !(k in cs.hourWeights)) return;
+              const right = dir === h.actualDir;
+              cs.hourWeights[k] *= Math.exp(LR * (right ? 1 : -1));
+            });
+            // Renormalize so weights stay in a sane range (mean ~1).
+            const ks = Object.keys(cs.hourWeights);
+            const mean = ks.reduce((a, k) => a + cs.hourWeights[k], 0) / ks.length;
+            if (mean > 0) ks.forEach(k => {
+              cs.hourWeights[k] = Math.max(0.2, Math.min(5, cs.hourWeights[k] / mean));
+            });
+            console.log(`[hour-learn] ${coin} updated hourly weights → ${JSON.stringify(Object.fromEntries(ks.map(k => [k, +cs.hourWeights[k].toFixed(2)])))}`);
+          }
         });
 
         // (b) Lock the hourly call at the half-hour mark (once per hour).
@@ -1203,28 +1226,39 @@ async function cycle() {
           const ref = strike != null ? strike : verified;
           const dirVs = price => price === ref ? 'FLAT' : (((price > ref) === strikeAbove) ? 'UP' : 'DOWN');
 
-          // Signals: ensemble price, AI price, the market, and the 4 latest 15-min
-          // block directions (their recent committed comparison calls).
           const ml = mlPredict(coin);
           const ens = predictNext(coin);
+          // Learn off BOTH: 15-min srcWeights (components) × hourly hourWeights (own results).
           const sw = cs.srcWeights || { market:1, ensemble:1, ai:1 };
+          const hw = cs.hourWeights;
           const signOf = dd => dd === 'UP' ? 1 : dd === 'DOWN' ? -1 : 0;
-          let vote = 0;
-          if (km && km.marketDir) vote += (sw.market || 1) * signOf(km.marketDir);
-          if (ens && typeof ens.predicted === 'number') vote += (sw.ensemble || 1) * signOf(dirVs(ens.predicted));
-          if (ml && typeof ml.predictedPrice === 'number') vote += (sw.ai || 1) * signOf(dirVs(ml.predictedPrice));
-          // Add the recent 15-min block consensus (last 4 scored/locked dirs).
+
+          // Each input's individual directional call (stored so we can score & learn).
+          const inputDirs = {
+            market: (km && km.marketDir) ? km.marketDir : null,
+            ensemble: (ens && typeof ens.predicted === 'number') ? dirVs(ens.predicted) : null,
+            ai: (ml && typeof ml.predictedPrice === 'number') ? dirVs(ml.predictedPrice) : null,
+            blocks: null
+          };
+          // 15-min block consensus over the last 4 blocks.
           const recent15 = (Array.isArray(cs.compare) ? cs.compare : []).slice(0, 4);
           let blockVote = 0;
           recent15.forEach(b => { blockVote += signOf(b.overallDir || b.aiDir); });
-          vote += 0.5 * blockVote; // 15-min blocks contribute, weighted modestly
+          inputDirs.blocks = blockVote > 0 ? 'UP' : blockVote < 0 ? 'DOWN' : null;
+
+          // Weighted vote: each input weighted by (its 15-min weight) × (its hourly weight).
+          let vote = 0;
+          if (inputDirs.market)   vote += (sw.market || 1)   * hw.market   * signOf(inputDirs.market);
+          if (inputDirs.ensemble) vote += (sw.ensemble || 1) * hw.ensemble * signOf(inputDirs.ensemble);
+          if (inputDirs.ai)       vote += (sw.ai || 1)       * hw.ai       * signOf(inputDirs.ai);
+          vote += hw.blocks * 0.5 * blockVote;
 
           const modelDir = vote > 0 ? 'UP' : vote < 0 ? 'DOWN' : null;
           cs.hourCompare.unshift({
             targetMs: hourEnd, hourStart, lockedAt: nowMs,
             refPrice: verified, strike, strikeAbove,
             marketDir: km ? km.marketDir : null, marketProbUp: km ? km.probUp : null,
-            modelDir, blockVote, scored: false
+            modelDir, blockVote, inputDirs, scored: false
           });
           cs.hourCompare = cs.hourCompare.slice(0, 200);
           console.log(`[hour] ${coin} locked ${modelDir} for hour ending ${new Date(hourEnd).toISOString()} (strike ${strike})`);
@@ -1441,7 +1475,8 @@ function coinSnapshot(id) {
         hourEndMs: hourEnd,
         halfwayMs: hourEnd - 30 * 60 * 1000,
         locksAtHalfway: true,
-        bands                                        // predicted price-range band + neighbors
+        bands,                                       // predicted price-range band + neighbors
+        weights: cs.hourWeights || { market:1, ensemble:1, ai:1, blocks:1 }  // learned hourly weights
       };
     })(),
     // Three-way comparison: market (Kalshi) vs ensemble vs AI
