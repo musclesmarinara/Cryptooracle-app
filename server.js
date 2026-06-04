@@ -856,10 +856,11 @@ async function cycle() {
       // Lock in all three direction calls for the next boundary (only once each),
       // then score them together when that boundary's actual price is known.
       if (!Array.isArray(cs.compare)) cs.compare = [];
-      if (!cs.compareScore) cs.compareScore = { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0}, overall:{c:0,n:0}, leak:{c:0,n:0} };
+      if (!cs.compareScore) cs.compareScore = { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0}, overall:{c:0,n:0}, leak:{c:0,n:0}, leak10:{c:0,n:0} };
       // Backfill 'overall' for states created before this feature existed.
       if (!cs.compareScore.overall) cs.compareScore.overall = { c:0, n:0 };
       if (!cs.compareScore.leak) cs.compareScore.leak = { c:0, n:0 };
+      if (!cs.compareScore.leak10) cs.compareScore.leak10 = { c:0, n:0 };
       // Per-source reliability weights (per coin). These rise when a source is
       // right and fall when it's wrong, so the Overall Pick learns whom to trust.
       // Start neutral at 1.0 each.
@@ -914,7 +915,7 @@ async function cycle() {
           // outcome — so it's an honest, scoreable 5-minute-horizon forecast. If it
           // never locked (backend missed that window), it simply isn't scored.
           // Tally correctness for each predictor that made a call.
-          [['market', c.marketDir], ['ensemble', c.ensembleDir], ['ai', c.aiDir], ['overall', c.overallDir], ['leak', c.leakLocked ? c.leakDir : null]].forEach(([k, dir]) => {
+          [['market', c.marketDir], ['ensemble', c.ensembleDir], ['ai', c.aiDir], ['overall', c.overallDir], ['leak', c.leakLocked ? c.leakDir : null], ['leak10', c.leak10Locked ? c.leak10Dir : null]].forEach(([k, dir]) => {
             if (!dir || actualDir === 'FLAT') return;
             cs.compareScore[k].n += 1;
             if (dir === actualDir) cs.compareScore[k].c += 1;
@@ -1081,19 +1082,31 @@ async function cycle() {
         const targetMs = nextBoundary();
         const msLeft = targetMs - nowMs;
         const entry = cs.compare.find(c => c.targetMs === targetMs);
-        // Within the 5-minutes-left window, and only if not already locked.
-        if (entry && !entry.leakLocked && msLeft <= 5 * 60 * 1000 && msLeft > 0) {
+        if (entry) {
           const km = kalshi[coin];
           const strike = (km && typeof km.strike === 'number') ? km.strike : null;
           const strikeAbove = !km || km.strikeAbove !== false;
           const ref = strike != null ? strike : entry.priceAtLock;
-          if (ref != null) {
+          const callDir = () => {
+            if (ref == null) return null;
             const above = verified > ref;
-            entry.leakDir = (verified === ref) ? 'FLAT' : ((above === strikeAbove) ? 'UP' : 'DOWN');
-            entry.leakLocked = true;
-            entry.leakLockedAt = nowMs;
-            entry.leakLockPrice = verified;
-            console.log(`[leak] ${coin} locked final call ${entry.leakDir} with ~5min left (price ${verified} vs ref ${ref})`);
+            return (verified === ref) ? 'FLAT' : ((above === strikeAbove) ? 'UP' : 'DOWN');
+          };
+          // 10-MIN leak: commits when 10 minutes remain (the 5-min point of the block).
+          if (!entry.leak10Locked && msLeft <= 10 * 60 * 1000 && msLeft > 0) {
+            const d = callDir();
+            if (d) {
+              entry.leak10Dir = d; entry.leak10Locked = true; entry.leak10LockedAt = nowMs; entry.leak10LockPrice = verified;
+              console.log(`[leak10] ${coin} locked final call ${d} with ~10min left (price ${verified} vs ref ${ref})`);
+            }
+          }
+          // 5-MIN leak: commits when 5 minutes remain (the 10-min point of the block).
+          if (!entry.leakLocked && msLeft <= 5 * 60 * 1000 && msLeft > 0) {
+            const d = callDir();
+            if (d) {
+              entry.leakDir = d; entry.leakLocked = true; entry.leakLockedAt = nowMs; entry.leakLockPrice = verified;
+              console.log(`[leak] ${coin} locked final call ${d} with ~5min left (price ${verified} vs ref ${ref})`);
+            }
           }
         }
       }
@@ -1197,6 +1210,35 @@ function coinSnapshot(id) {
     }
   }
 
+  // ----- LEAKAGE MODEL #2: 10-minutes-left horizon (locks earlier) -----
+  let leak10Live = null;
+  {
+    const km = (state.kalshi && state.kalshi[id]) ? state.kalshi[id] : null;
+    const strike = (km && typeof km.strike === 'number') ? km.strike : null;
+    const strikeAbove = !km || km.strikeAbove !== false;
+    const ref = strike != null ? strike
+              : (lockedPending && typeof lockedPending.priceAtPrediction === 'number' ? lockedPending.priceAtPrediction : null);
+    const msLeft = curBoundary - Date.now();
+    const lockedEntry = Array.isArray(cs.compare) ? cs.compare.find(c => c.targetMs === curBoundary && c.leak10Locked) : null;
+    if (livePrice != null && ref != null) {
+      const above = livePrice > ref;
+      const watchDir = (livePrice === ref) ? 'FLAT' : ((above === strikeAbove) ? 'UP' : 'DOWN');
+      const locked = !!lockedEntry;
+      leak10Live = {
+        targetMs: curBoundary,
+        secondsLeft: Math.max(0, Math.round(msLeft / 1000)),
+        minutesLeft: Math.max(0, Math.round(msLeft / 60000)),
+        locked,
+        dir: locked ? lockedEntry.leak10Dir : watchDir,
+        lockDir: locked ? lockedEntry.leak10Dir : null,
+        lockPrice: locked ? lockedEntry.leak10LockPrice : null,
+        livePrice,
+        ref,
+        refKind: strike != null ? 'strike' : 'block-open'
+      };
+    }
+  }
+
 
   // Honest comparison: ensemble's own direction hit-rate on its scored log.
   // (HIGHER means actual came in above prediction = ensemble said "lower than reality".)
@@ -1234,11 +1276,12 @@ function coinSnapshot(id) {
     log: log.slice(0, 100),
     live,
     leakLive,
+    leak10Live,
     // Three-way comparison: market (Kalshi) vs ensemble vs AI
     compare: {
       latest: (Array.isArray(cs.compare) && cs.compare.length) ? cs.compare[0] : null,
       recent: Array.isArray(cs.compare) ? cs.compare.filter(c => c.scored).slice(0, 30) : [],
-      score: cs.compareScore || { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0}, overall:{c:0,n:0}, leak:{c:0,n:0} },
+      score: cs.compareScore || { market:{c:0,n:0}, ensemble:{c:0,n:0}, ai:{c:0,n:0}, overall:{c:0,n:0}, leak:{c:0,n:0}, leak10:{c:0,n:0} },
       srcWeights: cs.srcWeights || { market:1, ensemble:1, ai:1 },
       // Elite forecasting metrics for the Overall Pick:
       elite: {
