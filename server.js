@@ -50,6 +50,14 @@ const KALSHI_SERIES = {
   ethereum: 'KXETH15M',
   ripple:   'KXXRP15M'
 };
+// Hourly above/below market series. From Kalshi's site the BTC hourly series is
+// "KXBTCD" ("Bitcoin price today at Nam/pm EST?"). ETH/XRP follow the same pattern
+// but are UNCONFIRMED — the /api/kalshi-raw-hourly diagnostic verifies them live.
+const KALSHI_SERIES_HOURLY = {
+  bitcoin:  'KXBTCD',
+  ethereum: 'KXETHD',
+  ripple:   'KXXRPD'
+};
 
 // ---------- Persistent State ----------
 let state = { coins: {}, lastPrices: {}, lastStatus: {}, updatedAt: null };
@@ -209,88 +217,86 @@ async function fetchAllSources() {
 // implied probability of "up". Purely for comparison — we never trade.
 // NOTE: Kalshi may rate-limit or geo-block cloud IPs; if so this returns null
 // and the dashboard simply shows "market data unavailable".
-async function fetchKalshi() {
+// Parse one Kalshi market object into our normalized shape (prob, dir, strike).
+async function parseKalshiMarket(pick) {
+  const num = v => { if (v == null) return null; const n = parseFloat(v); return isFinite(n) ? n : null; };
+  const asProb = (dollars, cents) => {
+    const d = num(dollars); if (d != null) return d > 1 ? d / 100 : d;
+    const c = num(cents);   if (c != null) return c / 100;
+    return null;
+  };
+  const lastP = asProb(pick.last_price_dollars, pick.last_price);
+  let yesBid = asProb(pick.yes_bid_dollars, pick.yes_bid);
+  let yesAsk = asProb(pick.yes_ask_dollars, pick.yes_ask);
+  if ((yesBid == null || yesBid === 0) && (yesAsk == null || yesAsk === 0) && (lastP == null || lastP === 0)) {
+    try {
+      const obr = await timedFetch(`${KALSHI_BASE}/markets/${pick.ticker}/orderbook`, 8000);
+      if (obr.ok) {
+        const obd = await obr.json();
+        const ob = obd.orderbook || obd.orderbook_fp || obd || {};
+        const yesLevels = ob.yes || ob.yes_dollars || [];
+        const noLevels  = ob.no  || ob.no_dollars  || [];
+        const toProb = x => x == null ? null : (x > 1 ? x / 100 : x);
+        const bestYes = yesLevels.length ? toProb(yesLevels[yesLevels.length - 1][0]) : null;
+        const bestNo  = noLevels.length  ? toProb(noLevels[noLevels.length - 1][0])   : null;
+        if (bestYes != null) yesBid = bestYes;
+        if (bestNo != null)  yesAsk = 1 - bestNo;
+      }
+    } catch {}
+  }
+  let probUp = null;
+  if (lastP != null && lastP > 0 && lastP < 1) probUp = lastP;
+  else if (yesBid != null && yesAsk != null && (yesBid > 0 || yesAsk > 0)) probUp = (yesBid + yesAsk) / 2;
+  else if (yesBid != null && yesBid > 0) probUp = yesBid;
+  else if (yesAsk != null && yesAsk > 0) probUp = yesAsk;
+  const strike = num(pick.floor_strike) ?? num(pick.cap_strike) ?? null;
+  const st = (pick.strike_type || '').toLowerCase();
+  const strikeAbove = st.includes('less') ? false : true;
+  return {
+    ticker: pick.ticker,
+    title: pick.title || pick.yes_sub_title || pick.subtitle || '',
+    probUp,
+    marketDir: probUp == null ? null : (probUp >= 0.5 ? 'UP' : 'DOWN'),
+    strike,
+    strikeAbove,
+    volume: num(pick.volume_fp) ?? num(pick.volume) ?? null
+  };
+}
+
+// Fetch the soonest-closing open market for each coin in a given series map.
+async function fetchKalshiSeries(seriesMap) {
   const out = {};
   for (const coin of COINS) {
     out[coin] = null;
     try {
-      const series = KALSHI_SERIES[coin];
-      // Get markets in this series that are open, soonest close first.
+      const series = seriesMap[coin];
       const url = `${KALSHI_BASE}/markets?series_ticker=${series}&status=open&limit=100`;
       const r = await timedFetch(url, 9000);
       if (!r.ok) { out[coin] = { error: 'kalshi ' + r.status }; continue; }
       const d = await r.json();
       const markets = d.markets || [];
       if (!markets.length) { out[coin] = { error: 'no open markets' }; continue; }
-      // Pick the market closing soonest in the future (the next 15-min interval).
       const now = Date.now();
       const upcoming = markets
         .map(m => ({ m, closeMs: Date.parse(m.close_time || m.expiration_time || 0) }))
         .filter(x => x.closeMs > now)
         .sort((a, b) => a.closeMs - b.closeMs);
       if (!upcoming.length) { out[coin] = { error: 'no upcoming' }; continue; }
-      const pick = upcoming[0].m;
-      // Kalshi's fixed-point migration returns price fields as STRINGS in dollars
-      // (e.g. "0.5700"), not numbers. parseFloat handles strings AND numbers.
-      const num = v => { if (v == null) return null; const n = parseFloat(v); return isFinite(n) ? n : null; };
-      const asProb = (dollars, cents) => {
-        const d = num(dollars); if (d != null) return d > 1 ? d / 100 : d;
-        const c = num(cents);   if (c != null) return c / 100;
-        return null;
-      };
-      const lastP = asProb(pick.last_price_dollars, pick.last_price);
-      let yesBid = asProb(pick.yes_bid_dollars, pick.yes_bid);
-      let yesAsk = asProb(pick.yes_ask_dollars, pick.yes_ask);
-
-      // The /markets list often returns 0/empty bid-ask for fast 15-min markets.
-      // Pull the market's orderbook directly — that's where the live resting
-      // bid/ask actually live for actively traded markets.
-      if ((yesBid == null || yesBid === 0) && (yesAsk == null || yesAsk === 0) && (lastP == null || lastP === 0)) {
-        try {
-          const obr = await timedFetch(`${KALSHI_BASE}/markets/${pick.ticker}/orderbook`, 8000);
-          if (obr.ok) {
-            const obd = await obr.json();
-            const ob = obd.orderbook || obd.orderbook_fp || obd || {};
-            // yes[]/no[] are arrays of [price, size]; best level is the last entry.
-            const yesLevels = ob.yes || ob.yes_dollars || [];
-            const noLevels  = ob.no  || ob.no_dollars  || [];
-            const toProb = x => x == null ? null : (x > 1 ? x / 100 : x);
-            const bestYes = yesLevels.length ? toProb(yesLevels[yesLevels.length - 1][0]) : null;
-            const bestNo  = noLevels.length  ? toProb(noLevels[noLevels.length - 1][0])   : null;
-            if (bestYes != null) yesBid = bestYes;
-            if (bestNo != null)  yesAsk = 1 - bestNo; // No bid at p == Yes ask at (1-p)
-          }
-        } catch {}
-      }
-
-      let probUp = null;
-      if (lastP != null && lastP > 0 && lastP < 1) probUp = lastP;
-      else if (yesBid != null && yesAsk != null && (yesBid > 0 || yesAsk > 0)) probUp = (yesBid + yesAsk) / 2;
-      else if (yesBid != null && yesBid > 0) probUp = yesBid;
-      else if (yesAsk != null && yesAsk > 0) probUp = yesAsk;
-
-      // The strike is the absolute price level the market grades against. Most
-      // 15-min markets are "greater_or_equal" (YES = price AT/ABOVE strike), but
-      // capture the type so a "below"-type market isn't interpreted backwards.
-      const strike = num(pick.floor_strike) ?? num(pick.cap_strike) ?? null;
-      // strikeAbove = true means YES resolves when price >= strike (the usual case).
-      const st = (pick.strike_type || '').toLowerCase();
-      const strikeAbove = st.includes('less') ? false : true; // 'less'/'less_or_equal' => YES is below
-      out[coin] = {
-        ticker: pick.ticker,
-        title: pick.title || pick.yes_sub_title || pick.subtitle || '',
-        closeMs: upcoming[0].closeMs,
-        probUp,                                   // 0..1, market's chance of "up"
-        marketDir: probUp == null ? null : (probUp >= 0.5 ? 'UP' : 'DOWN'),
-        strike,                                   // absolute price level for YES
-        strikeAbove,                              // true: YES = price >= strike
-        volume: num(pick.volume_fp) ?? num(pick.volume) ?? null
-      };
+      const parsed = await parseKalshiMarket(upcoming[0].m);
+      parsed.closeMs = upcoming[0].closeMs;
+      out[coin] = parsed;
     } catch (e) {
       out[coin] = { error: e.message };
     }
   }
   return out;
+}
+
+async function fetchKalshi() {
+  return fetchKalshiSeries(KALSHI_SERIES);
+}
+async function fetchKalshiHourly() {
+  return fetchKalshiSeries(KALSHI_SERIES_HOURLY);
 }
 
 // ---------- Deep historical seeding (multi-source, OHLC) ----------
@@ -474,6 +480,9 @@ function predictNext(coin) {
   return { predicted, models, priceAtPrediction: cur };
 }
 function nextBoundary() { const ms = 15 * 60 * 1000; return Math.ceil(Date.now() / ms) * ms; }
+// The end of the current clock hour (e.g. at 8:37 → 9:00). The hourly market
+// covers [hourStart, hourEnd); halfway is hourStart + 30min.
+function nextHourBoundary() { const ms = 60 * 60 * 1000; return Math.ceil(Date.now() / ms) * ms; }
 
 // ============================================================
 //  TRAINABLE MODEL (pure JS) — logistic reg for direction,
@@ -789,8 +798,11 @@ function recalcWeights(coin) {
 async function cycle() {
   try {
     const { perCoin, status } = await fetchAllSources();
-    const kalshi = await fetchKalshi();   // public market data for comparison
+    const kalshi = await fetchKalshi();   // public 15-min market data for comparison
     state.kalshi = kalshi;
+    // Hourly markets (refreshed each cycle; tolerate failure — it's a bonus signal).
+    try { state.kalshiHourly = await fetchKalshiHourly(); } catch { /* keep last */ }
+    const kalshiHourly = state.kalshiHourly || {};
     const nowMs = Date.now();
     COINS.forEach(coin => {
       // Guarantee this coin's state object exists and is well-formed before use.
@@ -1111,6 +1123,74 @@ async function cycle() {
         }
       }
 
+      // ===== HOURLY MODEL (the "hour Overall") =====
+      // Predicts the hourly Kalshi above/below market (e.g. 8:00–9:00). It combines
+      // the same signals the Overall uses PLUS the four 15-min blocks within the
+      // hour, and LOCKS its call at the half-hour mark (e.g. 8:30). Scored against
+      // the hour's settle vs the hourly strike (or the hour-open price).
+      if (verified !== null) {
+        if (!Array.isArray(cs.hourCompare)) cs.hourCompare = [];
+        if (!cs.hourScore) cs.hourScore = { market:{c:0,n:0}, model:{c:0,n:0} };
+        const hourEnd = nextHourBoundary();
+        const hourStart = hourEnd - 60 * 60 * 1000;
+        const halfway = hourStart + 30 * 60 * 1000;
+        const km = kalshiHourly[coin] || null;
+
+        // (a) Score any resolved hours.
+        cs.hourCompare.forEach(h => {
+          if (nowMs < h.targetMs || h.scored) return;
+          // Settle = averaged price over the last ~2 min of the hour.
+          const hist = Array.isArray(cs.priceHistory) ? cs.priceHistory : [];
+          const wp = hist.filter(p => p.t >= h.targetMs - 120000 && p.t <= h.targetMs + 5000);
+          const settle = wp.length ? wp.reduce((a, p) => a + p.c, 0) / wp.length : verified;
+          const ref = (typeof h.strike === 'number') ? h.strike : h.refPrice;
+          const sa = h.strikeAbove !== false;
+          const above = settle > ref;
+          h.actualDir = (settle === ref) ? 'FLAT' : ((above === sa) ? 'UP' : 'DOWN');
+          h.settle = settle; h.scored = true;
+          [['market', h.marketDir], ['model', h.modelDir]].forEach(([k, dir]) => {
+            if (!dir || h.actualDir === 'FLAT') return;
+            cs.hourScore[k].n += 1;
+            if (dir === h.actualDir) cs.hourScore[k].c += 1;
+          });
+        });
+
+        // (b) Lock the hourly call at the half-hour mark (once per hour).
+        const already = cs.hourCompare.find(h => h.targetMs === hourEnd);
+        if (!already && nowMs >= halfway) {
+          const strike = (km && typeof km.strike === 'number') ? km.strike : null;
+          const strikeAbove = !km || km.strikeAbove !== false;
+          const ref = strike != null ? strike : verified;
+          const dirVs = price => price === ref ? 'FLAT' : (((price > ref) === strikeAbove) ? 'UP' : 'DOWN');
+
+          // Signals: ensemble price, AI price, the market, and the 4 latest 15-min
+          // block directions (their recent committed comparison calls).
+          const ml = mlPredict(coin);
+          const ens = predictNext(coin);
+          const sw = cs.srcWeights || { market:1, ensemble:1, ai:1 };
+          const signOf = dd => dd === 'UP' ? 1 : dd === 'DOWN' ? -1 : 0;
+          let vote = 0;
+          if (km && km.marketDir) vote += (sw.market || 1) * signOf(km.marketDir);
+          if (ens && typeof ens.predicted === 'number') vote += (sw.ensemble || 1) * signOf(dirVs(ens.predicted));
+          if (ml && typeof ml.predictedPrice === 'number') vote += (sw.ai || 1) * signOf(dirVs(ml.predictedPrice));
+          // Add the recent 15-min block consensus (last 4 scored/locked dirs).
+          const recent15 = (Array.isArray(cs.compare) ? cs.compare : []).slice(0, 4);
+          let blockVote = 0;
+          recent15.forEach(b => { blockVote += signOf(b.overallDir || b.aiDir); });
+          vote += 0.5 * blockVote; // 15-min blocks contribute, weighted modestly
+
+          const modelDir = vote > 0 ? 'UP' : vote < 0 ? 'DOWN' : null;
+          cs.hourCompare.unshift({
+            targetMs: hourEnd, hourStart, lockedAt: nowMs,
+            refPrice: verified, strike, strikeAbove,
+            marketDir: km ? km.marketDir : null, marketProbUp: km ? km.probUp : null,
+            modelDir, blockVote, scored: false
+          });
+          cs.hourCompare = cs.hourCompare.slice(0, 200);
+          console.log(`[hour] ${coin} locked ${modelDir} for hour ending ${new Date(hourEnd).toISOString()} (strike ${strike})`);
+        }
+      }
+
 
       // Training is gradient descent over the full history, so we throttle it
       // rather than running it every single cycle.
@@ -1277,6 +1357,22 @@ function coinSnapshot(id) {
     live,
     leakLive,
     leak10Live,
+    // Hourly model: combines all signals + the 15-min blocks, locks at the half hour.
+    hourly: (() => {
+      const km = (state.kalshiHourly && state.kalshiHourly[id]) ? state.kalshiHourly[id] : null;
+      const latest = (Array.isArray(cs.hourCompare) && cs.hourCompare.length) ? cs.hourCompare[0] : null;
+      const hourEnd = Math.ceil(Date.now() / 3600000) * 3600000;
+      const lockedThisHour = latest && latest.targetMs === hourEnd ? latest : null;
+      return {
+        market: km,                                  // the hourly Kalshi market (strike, dir, prob)
+        latest: lockedThisHour,                      // this hour's locked call (null until :30)
+        recent: Array.isArray(cs.hourCompare) ? cs.hourCompare.filter(h => h.scored).slice(0, 24) : [],
+        score: cs.hourScore || { market:{c:0,n:0}, model:{c:0,n:0} },
+        hourEndMs: hourEnd,
+        halfwayMs: hourEnd - 30 * 60 * 1000,
+        locksAtHalfway: true
+      };
+    })(),
     // Three-way comparison: market (Kalshi) vs ensemble vs AI
     compare: {
       latest: (Array.isArray(cs.compare) && cs.compare.length) ? cs.compare[0] : null,
@@ -1341,6 +1437,39 @@ const server = http.createServer((req, res) => {
             last_price_dollars: pick ? pick.last_price_dollars : null,
             yes_bid_dollars: pick ? pick.yes_bid_dollars : null,
             yes_ask_dollars: pick ? pick.yes_ask_dollars : null,
+            volume_fp: pick ? pick.volume_fp : null
+          };
+        } catch (e) { result[coin] = { error: e.message }; }
+      }
+      sendJSON(res, 200, result);
+    })();
+    return;
+  }
+  if (p === '/api/kalshi-hourly-raw') {
+    // Diagnostic: confirm the HOURLY series tickers (KXBTCD etc.) return markets.
+    (async () => {
+      const result = {};
+      for (const coin of COINS) {
+        try {
+          const series = KALSHI_SERIES_HOURLY[coin];
+          const r = await timedFetch(`${KALSHI_BASE}/markets?series_ticker=${series}&status=open&limit=20`, 9000);
+          if (!r.ok) { result[coin] = { series, error: 'kalshi ' + r.status }; continue; }
+          const d = await r.json();
+          const markets = d.markets || [];
+          const now = Date.now();
+          const upcoming = markets
+            .map(m => ({ m, closeMs: Date.parse(m.close_time || m.expiration_time || 0) }))
+            .filter(x => x.closeMs > now)
+            .sort((a, b) => a.closeMs - b.closeMs);
+          const pick = upcoming.length ? upcoming[0].m : (markets[0] || null);
+          result[coin] = {
+            series, count: markets.length,
+            ticker: pick ? pick.ticker : null,
+            title: pick ? (pick.title || pick.yes_sub_title) : null,
+            close_time: pick ? pick.close_time : null,
+            floor_strike: pick ? pick.floor_strike : null,
+            last_price_dollars: pick ? pick.last_price_dollars : null,
+            yes_bid_dollars: pick ? pick.yes_bid_dollars : null,
             volume_fp: pick ? pick.volume_fp : null
           };
         } catch (e) { result[coin] = { error: e.message }; }
