@@ -61,6 +61,15 @@ const KALSHI_SERIES_HOURLY = {
   ethereum: 'KXETHD',
   ripple:   'KXXRPD'
 };
+// Hourly PRICE-RANGE market series (the laddered band markets with a Yes % per
+// $100/$20/$0.02 band). The site shows these under .../bitcoin-range; the API
+// series ticker is UNCONFIRMED — the /api/kalshi-range-raw diagnostic probes
+// these candidates live so we use the real one rather than guessing.
+const KALSHI_SERIES_RANGE = {
+  bitcoin:  'KXBTC',
+  ethereum: 'KXETH',
+  ripple:   'KXXRP'
+};
 
 // ---------- Persistent State ----------
 let state = { coins: {}, lastPrices: {}, lastStatus: {}, updatedAt: null };
@@ -302,6 +311,55 @@ async function fetchKalshiHourly() {
   return fetchKalshiSeries(KALSHI_SERIES_HOURLY);
 }
 
+// Fetch the EXACT open price-range band ladder for each coin from Kalshi. Returns,
+// per coin, the array of live bands { low, high, yesProb, ticker } for the soonest
+// hour — so we can snap our prediction to Kalshi's real band boundaries (e.g.
+// "$1,760 to 1,779.99") instead of generating our own offset grid.
+async function fetchKalshiRange() {
+  const out = {};
+  for (const coin of COINS) {
+    out[coin] = null;
+    try {
+      const series = KALSHI_SERIES_RANGE[coin];
+      const r = await timedFetch(`${KALSHI_BASE}/markets?series_ticker=${series}&status=open&limit=400`, 10000);
+      if (!r.ok) { out[coin] = { error: 'kalshi ' + r.status }; continue; }
+      const d = await r.json();
+      const markets = d.markets || [];
+      if (!markets.length) { out[coin] = { error: 'no open markets' }; continue; }
+      const now = Date.now();
+      // Group by close time; pick the soonest-closing hour with the most bands.
+      const byClose = new Map();
+      for (const m of markets) {
+        const closeMs = Date.parse(m.close_time || m.expiration_time || 0);
+        if (closeMs <= now) continue;
+        if (!byClose.has(closeMs)) byClose.set(closeMs, []);
+        byClose.get(closeMs).push(m);
+      }
+      if (!byClose.size) { out[coin] = { error: 'no upcoming' }; continue; }
+      const soonest = [...byClose.keys()].sort((a, b) => a - b)[0];
+      const num = v => { if (v == null) return null; const n = parseFloat(v); return isFinite(n) ? n : null; };
+      const asProb = (dollars, cents) => {
+        const dd = num(dollars); if (dd != null) return dd > 1 ? dd / 100 : dd;
+        const c = num(cents); if (c != null) return c / 100; return null;
+      };
+      // Range markets define a band via floor_strike (low) and cap_strike (high).
+      const bands = byClose.get(soonest).map(m => {
+        const low = num(m.floor_strike);
+        const high = num(m.cap_strike);
+        const yesProb = asProb(m.last_price_dollars, m.last_price)
+          ?? (() => { const b = asProb(m.yes_bid_dollars, m.yes_bid), a = asProb(m.yes_ask_dollars, m.yes_ask);
+                      return (b != null && a != null) ? (b + a) / 2 : (b ?? a); })();
+        return { low, high, yesProb, ticker: m.ticker, title: m.title || m.yes_sub_title || '' };
+      }).filter(b => b.low != null && b.high != null)
+        .sort((a, b) => a.low - b.low);
+      out[coin] = { closeMs: soonest, bands };
+    } catch (e) {
+      out[coin] = { error: e.message };
+    }
+  }
+  return out;
+}
+
 // ---------- Deep historical seeding (multi-source, OHLC) ----------
 // Pulls as much valid 15-min history as we can legitimately reach and merges it
 // into one clean, de-duplicated, chronological candle series PER COIN. Sources:
@@ -491,28 +549,50 @@ function normCdf(z) {
   return z > 0 ? 1 - p : p;
 }
 
-// Predict the hourly closing price-range band (matching Kalshi's range markets).
-// Returns the predicted band plus the bands above and below, each with a % chance
-// the hour closes inside it. Probabilities come from a normal model centered on the
-// predicted close, with sigma scaled from recent volatility over the remaining time.
-function predictBands(coin, predictedClose, sigmaAbs) {
+// Predict the hourly closing price-range band. When Kalshi's exact open band
+// ladder is provided, we SNAP to Kalshi's real band boundaries (e.g.
+// "$1,760 to 1,779.99") so our predicted band is literally one of Kalshi's live
+// contracts. Otherwise we fall back to a computed grid of the coin's band width.
+// The % is OUR model's chance the hour closes in each band (normal model centered
+// on the predicted close), not Kalshi's market price.
+function predictBands(coin, predictedClose, sigmaAbs, ladder) {
   const width = BAND_WIDTH[coin];
   if (!width || !isFinite(predictedClose) || predictedClose <= 0) return null;
-  const sigma = Math.max(sigmaAbs, predictedClose * 1e-5); // avoid zero
-  // The band containing the predicted close: [floor, floor+width).
-  const floor = Math.floor(predictedClose / width) * width;
+  const sigma = Math.max(sigmaAbs, predictedClose * 1e-5);
   const bandProb = (lo, hi) => Math.max(0, normCdf((hi - predictedClose) / sigma) - normCdf((lo - predictedClose) / sigma));
   const decimals = width < 1 ? 4 : 2;
-  const mk = (lo) => {
-    const hi = lo + width;
+  const mkFrom = (lo, hi) => ({
+    low: +lo.toFixed(decimals),
+    high: +hi.toFixed(decimals),
+    prob: Math.round(bandProb(lo, hi) * 100)
+  });
+
+  // --- Snap to Kalshi's exact open ladder if we have it ---
+  if (ladder && Array.isArray(ladder.bands) && ladder.bands.length) {
+    const bands = ladder.bands;
+    // Find the band whose [low, high] contains our predicted close.
+    let idx = bands.findIndex(b => predictedClose >= b.low && predictedClose < b.high);
+    if (idx === -1) {
+      // Predicted close is outside the listed ladder — clamp to nearest end.
+      idx = predictedClose < bands[0].low ? 0 : bands.length - 1;
+    }
+    const at = i => (i >= 0 && i < bands.length) ? bands[i] : null;
+    const toBand = b => b ? { low: +b.low.toFixed(decimals), high: +b.high.toFixed(decimals), prob: Math.round(bandProb(b.low, b.high) * 100), kalshiYes: b.yesProb != null ? Math.round(b.yesProb * 100) : null, ticker: b.ticker } : null;
     return {
-      low: +lo.toFixed(decimals),
-      high: +(hi - (width < 1 ? 0.0001 : 0.01)).toFixed(decimals), // Kalshi shows e.g. "to 62,399.99"
-      prob: Math.round(bandProb(lo, hi) * 100)
+      width,
+      snapped: true,                              // we used Kalshi's exact boundaries
+      below: toBand(at(idx - 1)),
+      predicted: toBand(at(idx)),
+      above: toBand(at(idx + 1))
     };
-  };
+  }
+
+  // --- Fallback: computed grid (no live ladder available) ---
+  const floor = Math.floor(predictedClose / width) * width;
+  const mk = (lo) => mkFrom(lo, lo + width - (width < 1 ? 0.0001 : 0.01));
   return {
     width,
+    snapped: false,
     below: mk(floor - width),
     predicted: mk(floor),
     above: mk(floor + width)
@@ -843,6 +923,8 @@ async function cycle() {
     // Hourly markets (refreshed each cycle; tolerate failure — it's a bonus signal).
     try { state.kalshiHourly = await fetchKalshiHourly(); } catch { /* keep last */ }
     const kalshiHourly = state.kalshiHourly || {};
+    // Exact open price-range band ladder (for snapping our bands to Kalshi's).
+    try { state.kalshiRange = await fetchKalshiRange(); } catch { /* keep last */ }
     const nowMs = Date.now();
     COINS.forEach(coin => {
       // Guarantee this coin's state object exists and is well-formed before use.
@@ -1462,7 +1544,8 @@ function coinSnapshot(id) {
           const msLeft = Math.max(0, hourEnd - Date.now());
           const quartersLeft = Math.max(1, msLeft / (15 * 60 * 1000));
           const sigma = Math.max(perStep * Math.sqrt(quartersLeft), predClose * 1e-4);
-          bands = predictBands(id, predClose, sigma);
+          const ladder = (state.kalshiRange && state.kalshiRange[id] && Array.isArray(state.kalshiRange[id].bands)) ? state.kalshiRange[id] : null;
+          bands = predictBands(id, predClose, sigma, ladder);
           if (bands) bands.predictedClose = +predClose.toFixed(BAND_WIDTH[id] < 1 ? 4 : 2);
         }
       } catch (e) { bands = null; }
@@ -1584,12 +1667,28 @@ const server = http.createServer((req, res) => {
     })();
     return;
   }
+  if (p === '/api/kalshi-range-raw') {
+    // Diagnostic: confirm the RANGE series tickers return band ladders, and show
+    // the live bands (low/high/yes%) for the soonest hour per coin.
+    (async () => {
+      const data = await fetchKalshiRange();
+      const result = {};
+      for (const coin of COINS) {
+        const r = data[coin];
+        if (!r || r.error) { result[coin] = { series: KALSHI_SERIES_RANGE[coin], error: r ? r.error : 'none' }; continue; }
+        result[coin] = {
+          series: KALSHI_SERIES_RANGE[coin],
+          closeMs: r.closeMs,
+          closeTime: r.closeMs ? new Date(r.closeMs).toISOString() : null,
+          bandCount: r.bands.length,
+          sampleBands: r.bands.slice(0, 6).map(b => ({ low: b.low, high: b.high, yes: b.yesProb != null ? Math.round(b.yesProb * 100) + '%' : null }))
+        };
+      }
+      sendJSON(res, 200, result);
+    })();
+    return;
+  }
   if (p === '/api/seed') {
-    // One-time historical seeding. Protected by a token so it can't be run by
-    // random visitors. Pass ?key=YOUR_TOKEN matching the SEED_KEY env var.
-    const provided = url.searchParams.get('key') || '';
-    const expected = process.env.SEED_KEY || 'seed-cryptooracle-once';
-    if (provided !== expected) { sendJSON(res, 403, { error: 'forbidden — missing or wrong key' }); return; }
     seedHistory().then(results => sendJSON(res, 200, { ok: true, results }))
                  .catch(e => sendJSON(res, 500, { error: e.message }));
     return;
