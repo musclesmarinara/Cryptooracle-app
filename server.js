@@ -1253,6 +1253,11 @@ async function cycle() {
       if (verified !== null) {
         if (!Array.isArray(cs.hourCompare)) cs.hourCompare = [];
         if (!cs.hourScore) cs.hourScore = { market:{c:0,n:0}, model:{c:0,n:0} };
+        // The scoring basis changed from direction → BAND. Reset any counts that
+        // were accumulated under the old basis so the % reflects band accuracy only.
+        if (cs.hourScore.basis !== 'band') {
+          cs.hourScore = { market:{c:0,n:0}, model:{c:0,n:0}, basis: 'band' };
+        }
         // Dedicated hourly weights for each input. These are SEPARATE from the
         // 15-min srcWeights and learn specifically from hourly outcomes — so the
         // hourly model learns off BOTH: the sharpening 15-min components (via
@@ -1266,23 +1271,45 @@ async function cycle() {
         // (a) Score any resolved hours — and LEARN from each input's accuracy.
         cs.hourCompare.forEach(h => {
           if (nowMs < h.targetMs || h.scored) return;
+          // Settle = averaged price over the last ~2 min of the hour. ONLY score
+          // if we actually have price data from around the hour's end — otherwise
+          // we'd be grading against a stale/current price and inventing accuracy.
           const hist = Array.isArray(cs.priceHistory) ? cs.priceHistory : [];
-          const wp = hist.filter(p => p.t >= h.targetMs - 120000 && p.t <= h.targetMs + 5000);
-          const settle = wp.length ? wp.reduce((a, p) => a + p.c, 0) / wp.length : verified;
+          const wp = hist.filter(p => p.t >= h.targetMs - 120000 && p.t <= h.targetMs + 60000);
+          if (!wp.length) {
+            // No real end-of-hour data (e.g. backend was asleep). Mark unscored and
+            // skip — better to have no data point than a fabricated one.
+            if (nowMs - h.targetMs > 6 * 60 * 60 * 1000) { h.scored = true; h.noData = true; }
+            return;
+          }
+          const settle = wp.reduce((a, p) => a + p.c, 0) / wp.length;
           const ref = (typeof h.strike === 'number') ? h.strike : h.refPrice;
           const sa = h.strikeAbove !== false;
           const above = settle > ref;
           h.actualDir = (settle === ref) ? 'FLAT' : ((above === sa) ? 'UP' : 'DOWN');
           h.settle = settle; h.scored = true;
-          [['market', h.marketDir], ['model', h.modelDir]].forEach(([k, dir]) => {
-            if (!dir || h.actualDir === 'FLAT') return;
-            cs.hourScore[k].n += 1;
-            if (dir === h.actualDir) cs.hourScore[k].c += 1;
-          });
-          // ----- Hourly learning step -----
-          // Multiplicative-weights update: each input that called the hour right
-          // gets nudged up, each that was wrong nudged down. Over many hours the
-          // model learns which inputs to trust at the hourly horizon specifically.
+
+          // ----- BAND scoring (what you asked for) -----
+          // Did the hour's close land inside the band we LOCKED at the 30-min mark?
+          if (h.lockedBands && h.lockedBands.predicted) {
+            const pb = h.lockedBands.predicted;
+            h.bandHit = (settle >= pb.low && settle <= pb.high);
+            h.bandLabel = `${pb.low} to ${pb.high}`;
+            cs.hourScore.model.n += 1;
+            if (h.bandHit) cs.hourScore.model.c += 1;
+            // Did Kalshi's then-favorite band (highest Yes%) contain the close?
+            // (Fair market comparison: the band the market thought most likely.)
+            if (typeof h.lockedBands.predicted.kalshiYes === 'number') {
+              // Use our locked snapshot's three bands; pick the market's top one.
+              const cand = [h.lockedBands.below, h.lockedBands.predicted, h.lockedBands.above].filter(Boolean);
+              const mktTop = cand.reduce((best, b) => (b.kalshiYes ?? -1) > (best?.kalshiYes ?? -1) ? b : best, null);
+              if (mktTop) {
+                cs.hourScore.market.n += 1;
+                if (settle >= mktTop.low && settle <= mktTop.high) cs.hourScore.market.c += 1;
+              }
+            }
+          }
+          // ----- Hourly learning step (still uses direction of inputs) -----
           if (h.actualDir !== 'FLAT' && h.inputDirs) {
             const LR = 0.06;
             Object.entries(h.inputDirs).forEach(([k, dir]) => {
@@ -1290,13 +1317,12 @@ async function cycle() {
               const right = dir === h.actualDir;
               cs.hourWeights[k] *= Math.exp(LR * (right ? 1 : -1));
             });
-            // Renormalize so weights stay in a sane range (mean ~1).
             const ks = Object.keys(cs.hourWeights);
             const mean = ks.reduce((a, k) => a + cs.hourWeights[k], 0) / ks.length;
             if (mean > 0) ks.forEach(k => {
               cs.hourWeights[k] = Math.max(0.2, Math.min(5, cs.hourWeights[k] / mean));
             });
-            console.log(`[hour-learn] ${coin} updated hourly weights → ${JSON.stringify(Object.fromEntries(ks.map(k => [k, +cs.hourWeights[k].toFixed(2)])))}`);
+            console.log(`[hour-learn] ${coin} weights → ${JSON.stringify(Object.fromEntries(ks.map(k => [k, +cs.hourWeights[k].toFixed(2)])))}`);
           }
         });
 
@@ -1586,7 +1612,15 @@ function coinSnapshot(id) {
       return {
         market: km,
         latest: lockedThisHour,
-        recent: Array.isArray(cs.hourCompare) ? cs.hourCompare.filter(h => h.scored).slice(0, 24) : [],
+        recent: Array.isArray(cs.hourCompare)
+          ? cs.hourCompare.filter(h => h.scored && !h.noData && h.lockedBands).slice(0, 5).map(h => ({
+              targetMs: h.targetMs,
+              lockedBand: h.bandLabel || (h.lockedBands && h.lockedBands.predicted ? `${h.lockedBands.predicted.low} to ${h.lockedBands.predicted.high}` : null),
+              settle: h.settle != null ? +h.settle.toFixed(BAND_WIDTH[id] < 1 ? 4 : 2) : null,
+              bandHit: !!h.bandHit,
+              dir: h.modelDir, actualDir: h.actualDir
+            }))
+          : [],
         score: cs.hourScore || { market:{c:0,n:0}, model:{c:0,n:0} },
         hourEndMs: hourEnd,
         halfwayMs: hourEnd - 30 * 60 * 1000,
