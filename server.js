@@ -1336,14 +1336,42 @@ async function cycle() {
           vote += hw.blocks * 0.5 * blockVote;
 
           const modelDir = vote > 0 ? 'UP' : vote < 0 ? 'DOWN' : null;
+
+          // Freeze the BAND prediction at the lock, using the model's predicted
+          // close right now (ensemble + AI averaged) snapped to Kalshi's exact
+          // open ladder. This commits the full pick — direction AND band — at the
+          // 30-minutes-before mark, so the whole thing is scoreable later.
+          let lockedBands = null;
+          try {
+            const preds = [];
+            if (ens && isFinite(ens.predicted)) preds.push(ens.predicted);
+            if (ml && isFinite(ml.predictedPrice)) preds.push(ml.predictedPrice);
+            const predClose = preds.length ? preds.reduce((a, b) => a + b, 0) / preds.length : verified;
+            const closes = (Array.isArray(cs.priceHistory) ? cs.priceHistory : []).slice(-20).map(p => p.c);
+            let perStep = 0;
+            if (closes.length > 2) {
+              const rets = [];
+              for (let i = 1; i < closes.length; i++) rets.push((closes[i] - closes[i - 1]) / closes[i - 1]);
+              perStep = stddev(rets) * predClose;
+            }
+            // ~30 min left at lock = 2 quarters.
+            const sigma = Math.max(perStep * Math.sqrt(2), predClose * 1e-4);
+            const ladder = (state.kalshiRange && state.kalshiRange[coin] && Array.isArray(state.kalshiRange[coin].bands)) ? state.kalshiRange[coin] : null;
+            lockedBands = predictBands(coin, predClose, sigma, ladder);
+            if (lockedBands) lockedBands.predictedClose = +predClose.toFixed(BAND_WIDTH[coin] < 1 ? 4 : 2);
+          } catch (e) { lockedBands = null; }
+
           cs.hourCompare.unshift({
             targetMs: hourEnd, hourStart, lockedAt: nowMs,
             refPrice: verified, strike, strikeAbove,
             marketDir: km ? km.marketDir : null, marketProbUp: km ? km.probUp : null,
-            modelDir, blockVote, inputDirs, scored: false
+            modelDir, blockVote, inputDirs,
+            lockedBands,                              // frozen band pick at the 30-min mark
+            lockedBandLabel: lockedBands && lockedBands.predicted ? `${lockedBands.predicted.low} to ${lockedBands.predicted.high}` : null,
+            scored: false
           });
           cs.hourCompare = cs.hourCompare.slice(0, 200);
-          console.log(`[hour] ${coin} locked ${modelDir} for hour ending ${new Date(hourEnd).toISOString()} (strike ${strike})`);
+          console.log(`[hour] ${coin} locked ${modelDir} + band ${lockedBands && lockedBands.predicted ? lockedBands.predicted.low + '-' + lockedBands.predicted.high : 'n/a'} for hour ending ${new Date(hourEnd).toISOString()}`);
         }
       }
 
@@ -1520,35 +1548,40 @@ function coinSnapshot(id) {
       const hourEnd = Math.ceil(Date.now() / 3600000) * 3600000;
       const lockedThisHour = latest && latest.targetMs === hourEnd ? latest : null;
 
-      // Price-range band prediction (matches Kalshi's range markets). Predict the
-      // hour's close (ensemble + AI averaged), and size sigma from recent 15-min
-      // volatility scaled to the time remaining in the hour.
+      // Band prediction. ONCE LOCKED (at the 30-min mark) we serve the FROZEN
+      // bands committed in the locked entry — they no longer move. Before the lock
+      // we show a live preview that updates with price.
       let bands = null;
-      try {
-        const ens = predictNext(id);
-        const ml = mlPredict(id);
-        const preds = [];
-        if (ens && isFinite(ens.predicted)) preds.push(ens.predicted);
-        if (ml && isFinite(ml.predictedPrice)) preds.push(ml.predictedPrice);
-        const live = state.lastPrices[id]?.verified ?? null;
-        const predClose = preds.length ? preds.reduce((a, b) => a + b, 0) / preds.length : live;
-        if (predClose != null) {
-          const closes = (Array.isArray(cs.priceHistory) ? cs.priceHistory : []).slice(-20).map(p => p.c);
-          // Per-15min stddev of returns → scale to remaining quarters in the hour.
-          let perStep = 0;
-          if (closes.length > 2) {
-            const rets = [];
-            for (let i = 1; i < closes.length; i++) rets.push((closes[i] - closes[i - 1]) / closes[i - 1]);
-            perStep = stddev(rets) * predClose;
+      let bandsLocked = false;
+      if (lockedThisHour && lockedThisHour.lockedBands) {
+        bands = lockedThisHour.lockedBands;
+        bandsLocked = true;
+      } else {
+        try {
+          const ens = predictNext(id);
+          const ml = mlPredict(id);
+          const preds = [];
+          if (ens && isFinite(ens.predicted)) preds.push(ens.predicted);
+          if (ml && isFinite(ml.predictedPrice)) preds.push(ml.predictedPrice);
+          const live = state.lastPrices[id]?.verified ?? null;
+          const predClose = preds.length ? preds.reduce((a, b) => a + b, 0) / preds.length : live;
+          if (predClose != null) {
+            const closes = (Array.isArray(cs.priceHistory) ? cs.priceHistory : []).slice(-20).map(p => p.c);
+            let perStep = 0;
+            if (closes.length > 2) {
+              const rets = [];
+              for (let i = 1; i < closes.length; i++) rets.push((closes[i] - closes[i - 1]) / closes[i - 1]);
+              perStep = stddev(rets) * predClose;
+            }
+            const msLeft = Math.max(0, hourEnd - Date.now());
+            const quartersLeft = Math.max(1, msLeft / (15 * 60 * 1000));
+            const sigma = Math.max(perStep * Math.sqrt(quartersLeft), predClose * 1e-4);
+            const ladder = (state.kalshiRange && state.kalshiRange[id] && Array.isArray(state.kalshiRange[id].bands)) ? state.kalshiRange[id] : null;
+            bands = predictBands(id, predClose, sigma, ladder);
+            if (bands) bands.predictedClose = +predClose.toFixed(BAND_WIDTH[id] < 1 ? 4 : 2);
           }
-          const msLeft = Math.max(0, hourEnd - Date.now());
-          const quartersLeft = Math.max(1, msLeft / (15 * 60 * 1000));
-          const sigma = Math.max(perStep * Math.sqrt(quartersLeft), predClose * 1e-4);
-          const ladder = (state.kalshiRange && state.kalshiRange[id] && Array.isArray(state.kalshiRange[id].bands)) ? state.kalshiRange[id] : null;
-          bands = predictBands(id, predClose, sigma, ladder);
-          if (bands) bands.predictedClose = +predClose.toFixed(BAND_WIDTH[id] < 1 ? 4 : 2);
-        }
-      } catch (e) { bands = null; }
+        } catch (e) { bands = null; }
+      }
 
       return {
         market: km,
@@ -1559,6 +1592,7 @@ function coinSnapshot(id) {
         halfwayMs: hourEnd - 30 * 60 * 1000,
         locksAtHalfway: true,
         bands,                                       // predicted price-range band + neighbors
+        bandsLocked,                                 // true once frozen at the 30-min mark
         weights: cs.hourWeights || { market:1, ensemble:1, ai:1, blocks:1 }  // learned hourly weights
       };
     })(),
