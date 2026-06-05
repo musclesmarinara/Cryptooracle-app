@@ -1258,6 +1258,10 @@ async function cycle() {
         if (cs.hourScore.basis !== 'band') {
           cs.hourScore = { market:{c:0,n:0}, model:{c:0,n:0}, basis: 'band' };
         }
+        // Tracking-start marker: hours whose lock happened before this time are
+        // shown as "pre-tracking / unverified" and do NOT count toward the %.
+        // Set once, the first time this version runs (i.e. "start tracking now").
+        if (!cs.hourTrackStart) cs.hourTrackStart = nowMs;
         // Dedicated hourly weights for each input. These are SEPARATE from the
         // 15-min srcWeights and learn specifically from hourly outcomes — so the
         // hourly model learns off BOTH: the sharpening 15-min components (via
@@ -1288,24 +1292,39 @@ async function cycle() {
           const above = settle > ref;
           h.actualDir = (settle === ref) ? 'FLAT' : ((above === sa) ? 'UP' : 'DOWN');
           h.settle = settle; h.scored = true;
+          // Was this hour locked AFTER tracking started? Only verified hours count.
+          h.verified = (typeof h.lockedAt === 'number') && (h.lockedAt >= (cs.hourTrackStart || 0));
 
-          // ----- BAND scoring (what you asked for) -----
+          // Compute the ACTUAL band the close landed in (snapped to the coin width),
+          // so the tracker can show "we locked X, it actually closed in Y".
+          {
+            const w = BAND_WIDTH[coin];
+            const lo = Math.floor(settle / w) * w;
+            const dp = w < 1 ? 4 : 2;
+            h.actualBand = `${+lo.toFixed(dp)} to ${+(lo + w - (w < 1 ? 0.0001 : 0.01)).toFixed(dp)}`;
+          }
+
+          // ----- BAND scoring -----
           // Did the hour's close land inside the band we LOCKED at the 30-min mark?
           if (h.lockedBands && h.lockedBands.predicted) {
             const pb = h.lockedBands.predicted;
             h.bandHit = (settle >= pb.low && settle <= pb.high);
             h.bandLabel = `${pb.low} to ${pb.high}`;
-            cs.hourScore.model.n += 1;
-            if (h.bandHit) cs.hourScore.model.c += 1;
-            // Did Kalshi's then-favorite band (highest Yes%) contain the close?
-            // (Fair market comparison: the band the market thought most likely.)
+            // Only verified hours (locked after tracking start) count toward the %.
+            if (h.verified) {
+              cs.hourScore.model.n += 1;
+              if (h.bandHit) cs.hourScore.model.c += 1;
+            }
+            // Kalshi's then-favorite band (highest Yes%) for a fair market comparison.
             if (typeof h.lockedBands.predicted.kalshiYes === 'number') {
-              // Use our locked snapshot's three bands; pick the market's top one.
               const cand = [h.lockedBands.below, h.lockedBands.predicted, h.lockedBands.above].filter(Boolean);
               const mktTop = cand.reduce((best, b) => (b.kalshiYes ?? -1) > (best?.kalshiYes ?? -1) ? b : best, null);
               if (mktTop) {
-                cs.hourScore.market.n += 1;
-                if (settle >= mktTop.low && settle <= mktTop.high) cs.hourScore.market.c += 1;
+                h.marketBandHit = (settle >= mktTop.low && settle <= mktTop.high);
+                if (h.verified) {
+                  cs.hourScore.market.n += 1;
+                  if (h.marketBandHit) cs.hourScore.market.c += 1;
+                }
               }
             }
           }
@@ -1616,8 +1635,10 @@ function coinSnapshot(id) {
           ? cs.hourCompare.filter(h => h.scored && !h.noData && h.lockedBands).slice(0, 5).map(h => ({
               targetMs: h.targetMs,
               lockedBand: h.bandLabel || (h.lockedBands && h.lockedBands.predicted ? `${h.lockedBands.predicted.low} to ${h.lockedBands.predicted.high}` : null),
+              actualBand: h.actualBand || null,
               settle: h.settle != null ? +h.settle.toFixed(BAND_WIDTH[id] < 1 ? 4 : 2) : null,
               bandHit: !!h.bandHit,
+              verified: !!h.verified,
               dir: h.modelDir, actualDir: h.actualDir
             }))
           : [],
